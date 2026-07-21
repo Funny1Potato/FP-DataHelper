@@ -57,7 +57,7 @@ version: 0.1.2
 ```
 tqdm, PyQt5, openpyxl, beautifulsoup4, requests, pandas, selenium, webdriver_manager
 ```
-* Release中有整合了Python3.10及全部所需模块的一键包，可以直接使用。
+* [Releases](releases)中有整合了Python3.10及全部所需模块的一键包，可以直接使用。
 
 ## 更新日志
 ### 2026.07.21 v0.1.2
