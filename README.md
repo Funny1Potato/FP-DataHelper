@@ -1,4 +1,4 @@
-# FP-DataHelper使用说明
+# FP-DataHelper
 version: 0.1.2
 ## 数据整理
 待处理文件须按一定的要求编辑后方可进行处理，可按照下文中的要求或参考 [example.xlsx](./example.xlsx) 的样式编辑
