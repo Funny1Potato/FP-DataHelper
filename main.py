@@ -63,7 +63,7 @@ class main_Ui_Form(object):
 
     def retranslateUi(self, Form):
         _translate = QtCore.QCoreApplication.translate
-        Form.setWindowTitle(_translate("Form", "FP-DataHelper - 0.1.2"))
+        Form.setWindowTitle(_translate("Form", "FP-DataHelper - 0.1.3"))
         self.run.setText(_translate("Form", "运行"))
         self.label.setText(_translate("Form", "方法："))
         self.label_2.setText(_translate("Form", "文件："))
