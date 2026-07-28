@@ -10,6 +10,7 @@ import os
 from tqdm import tqdm
 import json
 import subprocess
+from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog
 from main import main_Ui_Form
 
@@ -39,6 +40,12 @@ class MainForm(QMainWindow, main_Ui_Form):
         self.file.setPlaceholderText("请选择文件")#默认提示文本
         self.choosefile.clicked.connect(self.openFile)
         
+        #Para1文件选择按钮
+        self.choosefile_para1 = QtWidgets.QToolButton(self)
+        self.choosefile_para1.setGeometry(QtCore.QRect(290, 90, 80, 25))
+        self.choosefile_para1.setText("...")
+        self.choosefile_para1.clicked.connect(self.openFileForPara1)
+        
         #设置
         self.option.clicked.connect(self.option_clicked)
         
@@ -49,6 +56,12 @@ class MainForm(QMainWindow, main_Ui_Form):
     def openFile(self):
         fileName, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "xlsx Files (*.xlsx);;xls Files (*.xls);;All Files (*)")
         self.file.setText(fileName)#显示选择的文件路径
+    
+    #Para1文件选择对话框
+    def openFileForPara1(self):
+        fileName, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "xlsx Files (*.xlsx);;xls Files (*.xls);;All Files (*)")
+        if fileName:
+            self.input1.setText(fileName)
     
     #加载方法文件配置
     def Methods_changed(self, index):
