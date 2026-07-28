@@ -113,7 +113,7 @@
 
 ## 移植内容
 
-0.1.1版本整合了 [AromaNexus](https://github.com/rastagan-git/AromaNexus) 的部分功能，包括CAS号查询、香气属性查询。如需使用完整功能，请自行部署AromaNexus。
+本程序整合了 [AromaNexus](https://github.com/rastagan-git/AromaNexus) 的部分功能，包括CAS号查询、香气属性查询。如需使用完整功能，请自行部署AromaNexus。
 
 ### CAS号查询
 
