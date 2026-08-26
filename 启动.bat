@@ -1,1 +1,1 @@
-python Datahelper.py
+start "" pythonw Datahelper.py
