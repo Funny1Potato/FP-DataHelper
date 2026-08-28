@@ -14,11 +14,14 @@ if os.path.isdir(_embedded_python_dir):
     )
 
 from PyQt5 import QtWidgets, QtCore, QtGui
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QProgressDialog
-from PyQt5.QtCore import QProcess, QProcessEnvironment
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QFileDialog, QMessageBox, QProgressDialog,
+                              QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
+                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
+                              QWidget, QInputDialog)
+from PyQt5.QtCore import QProcess, QProcessEnvironment, QObject, pyqtSignal, Qt
 
 # 版本信息
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 __repo__ = "Funny1Potato/FP-DataHelper"
 
 # 导入更新模块
@@ -158,11 +161,15 @@ class main_Ui_Form(object):
         # 按钮行
         btn_layout = QtWidgets.QHBoxLayout()
         self.option = QtWidgets.QPushButton(widget)
-        self.option.setMinimumSize(QtCore.QSize(160, 50))
+        self.option.setMinimumSize(QtCore.QSize(120, 50))
         self.option.setObjectName("option")
         btn_layout.addWidget(self.option)
+        self.batch = QtWidgets.QPushButton(widget)
+        self.batch.setMinimumSize(QtCore.QSize(120, 50))
+        self.batch.setObjectName("batch")
+        btn_layout.addWidget(self.batch)
         self.run = QtWidgets.QPushButton(widget)
-        self.run.setMinimumSize(QtCore.QSize(160, 50))
+        self.run.setMinimumSize(QtCore.QSize(120, 50))
         self.run.setObjectName("run")
         btn_layout.addWidget(self.run)
         self.right_layout.addLayout(btn_layout)
@@ -176,6 +183,7 @@ class main_Ui_Form(object):
         _translate = QtCore.QCoreApplication.translate
         widget.setWindowTitle(_translate("Form", f"FP-DataHelper - {__version__}"))
         self.run.setText(_translate("Form", "运行"))
+        self.batch.setText(_translate("Form", "批量执行"))
         self.label.setText(_translate("Form", "方法："))
         self.label_2.setText(_translate("Form", "文件："))
         self.label_3.setText(_translate("Form", "参数1："))
@@ -186,8 +194,14 @@ class main_Ui_Form(object):
 
 
 # ==================== 工具函数 ====================
-# 设置文件路径
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+# 配置文件路径
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+BUILTIN_WORKFLOWS_FILE = os.path.join(CONFIG_DIR, "builtin_workflows.json")
+USER_WORKFLOWS_FILE = os.path.join(CONFIG_DIR, "user_workflows.json")
+
+# 确保配置目录存在
+os.makedirs(CONFIG_DIR, exist_ok=True)
 
 def load_settings():
     """加载设置"""
@@ -205,6 +219,35 @@ def save_settings(settings):
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=4, ensure_ascii=False)
 
+def load_workflows():
+    """加载预设工作流（合并内置和用户）"""
+    workflows = {}
+    # 加载内置预设
+    if os.path.exists(BUILTIN_WORKFLOWS_FILE):
+        try:
+            with open(BUILTIN_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                workflows.update(json.load(f))
+        except:
+            pass
+    # 加载用户预设
+    if os.path.exists(USER_WORKFLOWS_FILE):
+        try:
+            with open(USER_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                workflows.update(json.load(f))
+        except:
+            pass
+    return workflows
+
+def load_builtin_workflows():
+    """加载内置预设"""
+    if os.path.exists(BUILTIN_WORKFLOWS_FILE):
+        try:
+            with open(BUILTIN_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
 def get_folders(path):
     folders = []
     files = os.listdir(path)
@@ -212,6 +255,464 @@ def get_folders(path):
         if os.path.isdir(os.path.join(path, file)):
             folders.append(file)
     return folders
+
+
+# ==================== 批量执行相关类 ====================
+class AddTaskDialog(QDialog):
+    """添加任务对话框"""
+    def __init__(self, methods, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加方法")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setMinimumWidth(400)
+        self.methods = ["请选择方法"] + methods
+        
+        layout = QVBoxLayout(self)
+        
+        # 方法选择
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("方法:"))
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(self.methods)
+        self.method_combo.currentTextChanged.connect(self.on_method_changed)
+        method_layout.addWidget(self.method_combo, stretch=1)
+        layout.addLayout(method_layout)
+        
+        # 参数输入
+        self.para1_label = QLabel("参数1:")
+        self.para1_input = QLineEdit()
+        self.para1_input.setPlaceholderText("")
+        para1_layout = QHBoxLayout()
+        para1_layout.addWidget(self.para1_label)
+        para1_layout.addWidget(self.para1_input, stretch=1)
+        layout.addLayout(para1_layout)
+        
+        self.para2_label = QLabel("参数2:")
+        self.para2_input = QLineEdit()
+        self.para2_input.setPlaceholderText("")
+        para2_layout = QHBoxLayout()
+        para2_layout.addWidget(self.para2_label)
+        para2_layout.addWidget(self.para2_input, stretch=1)
+        layout.addLayout(para2_layout)
+        
+        self.para3_label = QLabel("参数3:")
+        self.para3_input = QLineEdit()
+        self.para3_input.setPlaceholderText("")
+        para3_layout = QHBoxLayout()
+        para3_layout.addWidget(self.para3_label)
+        para3_layout.addWidget(self.para3_input, stretch=1)
+        layout.addLayout(para3_layout)
+        
+        # 按钮
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+    
+    def on_method_changed(self, method_name):
+        """方法改变时更新参数提示"""
+        if method_name == "请选择方法":
+            self.para1_input.setPlaceholderText("")
+            self.para2_input.setPlaceholderText("")
+            self.para3_input.setPlaceholderText("")
+            return
+        
+        try:
+            with open(f"./Methods/{method_name}/Config.json", "r", encoding="utf-8") as f:
+                config = json.load(f)
+            self.para1_input.setPlaceholderText(config.get("Para1", ""))
+            self.para2_input.setPlaceholderText(config.get("Para2", ""))
+            self.para3_input.setPlaceholderText(config.get("Para3", ""))
+        except:
+            pass
+    
+    def get_task(self):
+        """获取任务配置"""
+        method = self.method_combo.currentText()
+        if method == "请选择方法":
+            return None
+        return {
+            "method": method,
+            "para1": self.para1_input.text() or "",
+            "para2": self.para2_input.text() or "",
+            "para3": self.para3_input.text() or ""
+        }
+
+
+class BatchDialog(QDialog):
+    """批量执行对话框"""
+    def __init__(self, methods, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("批量执行")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setMinimumSize(700, 450)
+        self.methods = methods
+        self.task_queue = []
+        
+        layout = QVBoxLayout(self)
+        
+        # 任务表格
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["#", "方法", "参数1", "参数2", "参数3"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.table)
+        
+        # 操作按钮
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("添加方法")
+        add_btn.clicked.connect(self.add_task)
+        delete_btn = QPushButton("删除选中")
+        delete_btn.clicked.connect(self.remove_task)
+        up_btn = QPushButton("↑")
+        up_btn.setMaximumWidth(40)
+        up_btn.clicked.connect(self.move_up)
+        down_btn = QPushButton("↓")
+        down_btn.setMaximumWidth(40)
+        down_btn.clicked.connect(self.move_down)
+        
+        btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(delete_btn)
+        btn_layout.addWidget(up_btn)
+        btn_layout.addWidget(down_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # 输入文件选择
+        file_layout = QHBoxLayout()
+        file_layout.addWidget(QLabel("输入文件:"))
+        self.file_input = QLineEdit()
+        self.file_input.setPlaceholderText("选择第一个任务的输入文件")
+        file_layout.addWidget(self.file_input, stretch=1)
+        file_btn = QPushButton("选择文件")
+        file_btn.clicked.connect(self.select_file)
+        file_layout.addWidget(file_btn)
+        layout.addLayout(file_layout)
+        
+        # 预设工作流
+        workflow_layout = QHBoxLayout()
+        workflow_layout.addWidget(QLabel("预设工作流:"))
+        self.workflow_combo = QComboBox()
+        self.workflow_combo.addItem("自定义")
+        workflows = load_workflows()
+        self.workflow_combo.addItems(workflows.keys())
+        self.workflow_combo.currentTextChanged.connect(self.load_workflow)
+        workflow_layout.addWidget(self.workflow_combo, stretch=1)
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.save_workflow)
+        workflow_layout.addWidget(save_btn)
+        delete_btn = QPushButton("删除")
+        delete_btn.clicked.connect(self.delete_workflow)
+        workflow_layout.addWidget(delete_btn)
+        layout.addLayout(workflow_layout)
+        
+        # 执行/取消按钮
+        exec_layout = QHBoxLayout()
+        exec_layout.addStretch()
+        exec_btn = QPushButton("执行")
+        exec_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        exec_layout.addWidget(exec_btn)
+        exec_layout.addWidget(cancel_btn)
+        layout.addLayout(exec_layout)
+    
+    def add_task(self):
+        """添加任务"""
+        dialog = AddTaskDialog(self.methods, self)
+        if dialog.exec_() == QDialog.Accepted:
+            task = dialog.get_task()
+            if task:
+                self.task_queue.append(task)
+                self.update_table()
+    
+    def select_file(self):
+        """选择输入文件"""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "选择文件", "", 
+            "xlsx Files (*.xlsx);;xls Files (*.xls);;All Files (*)"
+        )
+        if file_name:
+            self.file_input.setText(file_name)
+    
+    def remove_task(self):
+        """删除选中任务"""
+        row = self.table.currentRow()
+        if row >= 0:
+            self.task_queue.pop(row)
+            self.update_table()
+    
+    def move_up(self):
+        """上移选中任务"""
+        row = self.table.currentRow()
+        if row > 0:
+            self.task_queue[row], self.task_queue[row-1] = self.task_queue[row-1], self.task_queue[row]
+            self.update_table()
+            self.table.selectRow(row-1)
+    
+    def move_down(self):
+        """下移选中任务"""
+        row = self.table.currentRow()
+        if row < len(self.task_queue) - 1:
+            self.task_queue[row], self.task_queue[row+1] = self.task_queue[row+1], self.task_queue[row]
+            self.update_table()
+            self.table.selectRow(row+1)
+    
+    def load_workflow(self, name=None):
+        """加载预设工作流"""
+        if name is None:
+            name = self.workflow_combo.currentText()
+        if name == "自定义":
+            return
+        
+        workflows = load_workflows()
+        if name in workflows:
+            self.task_queue = workflows[name].copy()
+            self.update_table()
+    
+    def save_workflow(self):
+        """保存当前任务队列为预设工作流"""
+        if not self.task_queue:
+            QMessageBox.warning(self, "保存失败", "任务队列为空，无法保存")
+            return
+        
+        # 弹出输入对话框获取名称
+        name, ok = QInputDialog.getText(self, "保存预设", "请输入预设名称:")
+        if not ok or not name.strip():
+            return
+        
+        name = name.strip()
+        
+        # 检查是否为内置预设名称
+        builtin_workflows = load_builtin_workflows()
+        if name in builtin_workflows:
+            QMessageBox.warning(self, "保存失败", f"'{name}' 是内置预设名称，请使用其他名称")
+            return
+        
+        # 加载用户预设
+        user_workflows = {}
+        if os.path.exists(USER_WORKFLOWS_FILE):
+            try:
+                with open(USER_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                    user_workflows = json.load(f)
+            except:
+                pass
+        
+        # 检查是否已存在
+        if name in user_workflows:
+            reply = QMessageBox.question(
+                self, "覆盖确认",
+                f"预设 '{name}' 已存在，是否覆盖？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        
+        # 保存（不包含 input_file）
+        save_queue = []
+        for task in self.task_queue:
+            save_queue.append({
+                "method": task["method"],
+                "para1": task.get("para1", ""),
+                "para2": task.get("para2", ""),
+                "para3": task.get("para3", "")
+            })
+        
+        user_workflows[name] = save_queue
+        
+        # 写入用户预设文件
+        try:
+            with open(USER_WORKFLOWS_FILE, "w", encoding="utf-8") as f:
+                json.dump(user_workflows, f, indent=4, ensure_ascii=False)
+            
+            # 更新下拉框
+            all_workflows = load_workflows()
+            self.workflow_combo.clear()
+            self.workflow_combo.addItem("自定义")
+            self.workflow_combo.addItems(all_workflows.keys())
+            self.workflow_combo.setCurrentText(name)
+            
+            QMessageBox.information(self, "保存成功", f"预设 '{name}' 已保存")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"保存失败: {str(e)}")
+    
+    def delete_workflow(self):
+        """删除选中的预设工作流"""
+        name = self.workflow_combo.currentText()
+        if name == "自定义":
+            return
+        
+        # 检查是否为内置预设
+        builtin_workflows = load_builtin_workflows()
+        if name in builtin_workflows:
+            QMessageBox.warning(self, "删除失败", f"'{name}' 是内置预设，无法删除")
+            return
+        
+        reply = QMessageBox.question(
+            self, "删除确认",
+            f"确定要删除预设 '{name}' 吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        # 加载并删除用户预设
+        user_workflows = {}
+        if os.path.exists(USER_WORKFLOWS_FILE):
+            try:
+                with open(USER_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                    user_workflows = json.load(f)
+            except:
+                pass
+        
+        if name in user_workflows:
+            del user_workflows[name]
+            
+            try:
+                with open(USER_WORKFLOWS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(user_workflows, f, indent=4, ensure_ascii=False)
+                
+                # 更新下拉框
+                all_workflows = load_workflows()
+                self.workflow_combo.clear()
+                self.workflow_combo.addItem("自定义")
+                self.workflow_combo.addItems(all_workflows.keys())
+                
+                QMessageBox.information(self, "删除成功", f"预设 '{name}' 已删除")
+            except Exception as e:
+                QMessageBox.critical(self, "删除失败", f"删除失败: {str(e)}")
+    
+    def update_table(self):
+        """更新表格显示"""
+        self.table.setRowCount(len(self.task_queue))
+        for i, task in enumerate(self.task_queue):
+            self.table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+            self.table.setItem(i, 1, QTableWidgetItem(task["method"]))
+            self.table.setItem(i, 2, QTableWidgetItem(task.get("para1", "")))
+            self.table.setItem(i, 3, QTableWidgetItem(task.get("para2", "")))
+            self.table.setItem(i, 4, QTableWidgetItem(task.get("para3", "")))
+    
+    def get_task_queue(self):
+        """获取任务队列和输入文件"""
+        input_file = self.file_input.text() or ""
+        return self.task_queue, input_file
+
+
+class BatchExecutor(QObject):
+    """批量执行器"""
+    task_started = pyqtSignal(int, str)
+    task_finished = pyqtSignal(int, str)
+    all_finished = pyqtSignal()
+    task_failed = pyqtSignal(int, str)
+    output_ready = pyqtSignal(str)  # 实时输出信号
+    
+    def __init__(self, task_queue, parent=None):
+        super().__init__(parent)
+        self.task_queue = task_queue
+        self.current_index = 0
+        self.last_output = None
+        self.process = None
+        self.output_buffer = ""
+    
+    def start(self):
+        """开始执行"""
+        if not self.task_queue:
+            self.all_finished.emit()
+            return
+        self.current_index = 0
+        self.last_output = None
+        self.execute_next()
+    
+    def execute_next(self):
+        """执行下一个任务"""
+        if self.current_index >= len(self.task_queue):
+            self.all_finished.emit()
+            return
+        
+        task = self.task_queue[self.current_index]
+        method = task["method"]
+        
+        # 第一个任务使用指定输入文件，后续任务使用上一步输出
+        if self.current_index == 0:
+            input_file = task.get("input_file", "")
+        else:
+            input_file = self.last_output or ""
+        
+        self.task_started.emit(self.current_index, method)
+        self.run_method(method, task.get("para1", ""), task.get("para2", ""), 
+                       task.get("para3", ""), input_file)
+    
+    def run_method(self, method, para1, para2, para3, input_file):
+        """运行单个方法"""
+        path = f"./Methods/{method}/__init__.py"
+        param = json.dumps({"Para1": para1, "Para2": para2, "Para3": para3, "File": input_file})
+        
+        self.output_buffer = ""
+        self.process = QProcess()
+        self.process.setProcessChannelMode(QProcess.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self.on_ready_read)
+        self.process.finished.connect(self.on_finished)
+        
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        self.process.setProcessEnvironment(env)
+        
+        self.process.start(sys.executable, [path, param])
+    
+    def on_ready_read(self):
+        """读取输出"""
+        if self.process:
+            data = self.process.readAllStandardOutput().data()
+            try:
+                text = data.decode('gbk', errors='replace')
+            except:
+                text = data.decode('utf-8', errors='replace')
+            if text:
+                self.output_buffer += text
+                # 清理 tqdm 控制字符并发送
+                lines = text.split('\r')
+                for line in lines:
+                    clean = line.strip()
+                    if clean:
+                        self.output_ready.emit(clean)
+    
+    def on_finished(self, exit_code, exit_status):
+        """任务完成"""
+        if exit_code != 0:
+            self.task_failed.emit(self.current_index, self.output_buffer)
+            return
+        
+        # 解析输出文件路径
+        output_file = self.parse_output(self.output_buffer)
+        if output_file:
+            self.last_output = output_file
+        
+        self.task_finished.emit(self.current_index, output_file or "")
+        self.current_index += 1
+        self.execute_next()
+    
+    def parse_output(self, text):
+        """解析输出，提取文件路径"""
+        import re
+        patterns = [
+            r"文件保存至[：:]\s*(.+)",
+            r"最终文件保存至[：:]\s*(.+)"
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1).strip()
+        return None
+    
+    def stop(self):
+        """停止执行"""
+        if self.process and self.process.state() == QProcess.Running:
+            self.process.kill()
 
 
 # ==================== 主窗口 ====================
@@ -249,6 +750,7 @@ class MainForm(QMainWindow, main_Ui_Form):
 
         # 按钮
         self.option.clicked.connect(self.option_clicked)
+        self.batch.clicked.connect(self.batch_clicked)
         self.run.clicked.connect(self.run_clicked)
         self.clear_btn.clicked.connect(self.clear_output)
 
@@ -307,7 +809,7 @@ class MainForm(QMainWindow, main_Ui_Form):
             widget.setFixedHeight(new_height)
 
         # 应用到按钮
-        for widget in [self.option, self.run]:
+        for widget in [self.option, self.batch, self.run]:
             widget.setFixedSize(QtCore.QSize(new_btn_width, new_btn_height))
 
         # 更新字体
@@ -357,12 +859,101 @@ class MainForm(QMainWindow, main_Ui_Form):
             self.input2.setPlaceholderText("")
             self.input3.setPlaceholderText("")
 
+    def batch_clicked(self):
+        """打开批量执行对话框"""
+        methods = get_folders("./Methods")
+        dialog = BatchDialog(methods, self)
+        
+        # 如果主窗口有文件选择，预填到对话框
+        if self.file.text():
+            dialog.file_input.setText(self.file.text())
+        
+        if dialog.exec_() == QDialog.Accepted:
+            task_queue, input_file = dialog.get_task_queue()
+            if not task_queue:
+                self.append_output("任务队列为空")
+                return
+            
+            # 检查输入文件
+            if not input_file:
+                self.append_output("请先选择输入文件")
+                return
+            task_queue[0]["input_file"] = input_file
+            
+            self.append_output("=" * 40)
+            self.append_output("开始批量执行")
+            self.append_output(f"共 {len(task_queue)} 个任务")
+            self.append_output("=" * 40)
+            
+            # 禁用按钮
+            self.run.setText("停止批量")
+            self.batch.setEnabled(False)
+            self.option.setEnabled(False)
+            
+            # 创建执行器
+            self.batch_executor = BatchExecutor(task_queue, self)
+            self.batch_executor.task_started.connect(self.on_batch_task_started)
+            self.batch_executor.task_finished.connect(self.on_batch_task_finished)
+            self.batch_executor.task_failed.connect(self.on_batch_task_failed)
+            self.batch_executor.all_finished.connect(self.on_batch_all_finished)
+            self.batch_executor.output_ready.connect(self.append_output)
+            self.batch_executor.start()
+    
+    def on_batch_task_started(self, index, method):
+        """批量任务开始"""
+        self.append_output(f"\n>>> 执行任务 {index + 1}: {method}")
+        self.append_output("-" * 30)
+    
+    def on_batch_task_finished(self, index, output_file):
+        """批量任务完成"""
+        self.append_output(f"任务 {index + 1} 完成")
+        if output_file:
+            self.append_output(f"输出文件: {output_file}")
+    
+    def on_batch_task_failed(self, index, error):
+        """批量任务失败"""
+        self.append_output(f"任务 {index + 1} 失败")
+        self.append_output(f"错误: {error}")
+        
+        # 询问用户如何处理
+        reply = QMessageBox.question(
+            self, "任务失败",
+            f"任务 {index + 1} 执行失败，是否继续？",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Retry
+        )
+        
+        if reply == QMessageBox.Retry:
+            # 重试当前任务
+            self.batch_executor.current_index = index
+            self.batch_executor.execute_next()
+        elif reply == QMessageBox.Yes:
+            # 跳过，继续下一个
+            self.batch_executor.current_index = index + 1
+            self.batch_executor.execute_next()
+        else:
+            # 终止
+            self.batch_executor.stop()
+            self.on_batch_all_finished()
+    
+    def on_batch_all_finished(self):
+        """批量任务全部完成"""
+        self.append_output("\n" + "=" * 40)
+        self.append_output("批量执行完成")
+        self.append_output("=" * 40)
+        
+        # 恢复按钮
+        self.run.setText("运行")
+        self.batch.setEnabled(True)
+        self.option.setEnabled(True)
+        self.batch_executor = None
+
     def option_clicked(self):
         """打开设置对话框"""
         settings = load_settings()
         
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("设置")
+        dialog.setWindowFlags(dialog.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         dialog.setMinimumWidth(350)
         
         layout = QtWidgets.QVBoxLayout(dialog)
@@ -450,12 +1041,14 @@ class MainForm(QMainWindow, main_Ui_Form):
         """发送输入到子进程"""
         if self.process and self.process.state() == QProcess.Running:
             text = self.cmd_input.text()
+            # 显示用户输入
             if text:
-                # 显示用户输入
                 self.append_output(f">>> {text}")
-                # 发送到子进程
-                self.process.write((text + '\n').encode('gbk'))
-                self.cmd_input.clear()
+            else:
+                self.append_output(">>> (回车)")
+            # 发送到子进程（即使为空也发送换行符）
+            self.process.write((text + '\n').encode('gbk'))
+            self.cmd_input.clear()
 
     def set_input_enabled(self, enabled):
         """启用/禁用输入区域"""
@@ -465,6 +1058,18 @@ class MainForm(QMainWindow, main_Ui_Form):
             self.cmd_input.setFocus()
 
     def run_clicked(self):
+        # 如果正在运行批量任务，停止批量执行
+        if hasattr(self, 'batch_executor') and self.batch_executor:
+            self.batch_executor.stop()
+            self.append_output(">>> 用户终止了批量执行")
+            return
+        
+        # 如果正在运行单个任务，点击变为停止
+        if self.process and self.process.state() == QProcess.Running:
+            self.process.kill()
+            self.append_output(">>> 用户终止了程序")
+            return
+
         text = self.ChooseMethods.currentText()
         if text == "请选择方法":
             self.append_output("请先选择一个方法")
@@ -486,9 +1091,8 @@ class MainForm(QMainWindow, main_Ui_Form):
 
         param = json.dumps({"Para1": para1, "Para2": para2, "Para3": para3, "File": file})
 
-        # 禁用运行按钮，启用输入
-        self.run.setEnabled(False)
-        self.run.setText("运行中...")
+        # 启用停止功能
+        self.run.setText("停止")
         self.set_input_enabled(True)
         self.append_output(f"开始执行: {text}")
         self.append_output("-" * 40)
