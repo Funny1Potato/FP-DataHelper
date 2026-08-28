@@ -1,0 +1,34 @@
+{
+    "推荐预设": [
+        {
+            "method": "Sorter-0.1.0",
+            "para1": "0.5",
+            "para2": "",
+            "para3": ""
+        },
+        {
+            "method": "Name_to_CAS--AromaNexus",
+            "para1": "",
+            "para2": "",
+            "para3": ""
+        },
+        {
+            "method": "Threshold_Full",
+            "para1": "",
+            "para2": "",
+            "para3": ""
+        },
+        {
+            "method": "Cb_Spider--AromaNexus",
+            "para1": "",
+            "para2": "",
+            "para3": ""
+        },
+        {
+            "method": "Si_Marker",
+            "para1": "",
+            "para2": "",
+            "para3": ""
+        }
+    ]
+}
