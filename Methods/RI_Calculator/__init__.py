@@ -9,6 +9,15 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from PyQt5.QtWidgets import QApplication, QMessageBox
+from pathlib import Path
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from method_support import (
+    process_workbook, report_output, run_script, save_workbook, should_append_columns, write_columns,
+)
+
 
 # ================= 公共识别函数 =================
 def col_letters():
@@ -65,25 +74,37 @@ def detect_header_row(ws, max_rows=20):
 def load_alkanes(file_path):
     """读取正构烷烃参考文件，返回 [(carbon_num, rt), ...] 按碳数升序排列。"""
     wb = openpyxl.load_workbook(file_path, data_only=True)
-    ws = wb.active
     alkanes = []
-    for row in ws.iter_rows(min_row=1, values_only=True):
-        if len(row) < 2:
-            continue
-        carbon_val, rt_val = row[0], row[1]
-        if carbon_val is None or rt_val is None:
-            continue
-        try:
-            carbon_num = int(carbon_val)
-            rt = float(rt_val)
-        except (ValueError, TypeError):
-            continue
-        if carbon_num > 0 and rt > 0:
-            alkanes.append((carbon_num, rt))
-    wb.close()
+    try:
+        rows = wb.active.iter_rows(min_col=1, max_col=2, values_only=True)
+        for row_no, (carbon_value, time_value) in enumerate(rows, 1):
+            if all(value is None or str(value).strip() == "" for value in (carbon_value, time_value)):
+                continue
+            try:
+                carbon = float(carbon_value)
+            except (TypeError, ValueError):
+                if not alkanes and isinstance(carbon_value, str):
+                    continue  # Optional text headings above the reference rows.
+                raise ValueError(f"参考表第 {row_no} 行的碳数无效。") from None
+            if not math.isfinite(carbon) or carbon < 1 or not carbon.is_integer():
+                raise ValueError(f"参考表第 {row_no} 行的碳数必须是正整数。")
+            try:
+                rt = float(time_value)
+            except (TypeError, ValueError):
+                raise ValueError(f"参考表第 {row_no} 行缺少有效的保留时间。") from None
+            if not math.isfinite(rt) or rt <= 0:
+                raise ValueError(f"参考表第 {row_no} 行的保留时间必须是有限正数。")
+            alkanes.append((int(carbon), rt))
+    finally:
+        wb.close()
     if len(alkanes) < 2:
         raise ValueError(f"正构烷烃参考文件中有效数据不足（至少需要2个），当前读取到 {len(alkanes)} 个。")
     alkanes.sort(key=lambda x: x[0])
+    for (lower, lower_rt), (upper, upper_rt) in zip(alkanes, alkanes[1:]):
+        if lower == upper:
+            raise ValueError(f"正构烷烃参考表重复填写了 C{lower}。")
+        if upper_rt <= lower_rt:
+            raise ValueError(f"正构烷烃保留时间必须随碳数递增，请检查 C{lower} 与 C{upper}。")
     return alkanes
 
 # ================= 保留指数计算 =================
@@ -108,7 +129,8 @@ def calc_ri_kovats(t_x, alkanes):
         if t_z <= t_x < t_z1:
             if t_z <= 0 or t_z1 <= 0:
                 return None
-            ri = 100 * (z + (math.log10(t_x) - math.log10(t_z)) / (math.log10(t_z1) - math.log10(t_z)))
+            fraction = (math.log10(t_x) - math.log10(t_z)) / (math.log10(t_z1) - math.log10(t_z))
+            ri = 100 * (z + (z1 - z) * fraction)
             return round(ri, 1)
     return None
 
@@ -129,7 +151,8 @@ def calc_ri_linear(t_x, alkanes):
         if t_z <= t_x < t_z1:
             if t_z1 == t_z:
                 return None
-            ri = 100 * (z + (t_x - t_z) / (t_z1 - t_z))
+            fraction = (t_x - t_z) / (t_z1 - t_z)
+            ri = 100 * (z + (z1 - z) * fraction)
             return round(ri, 1)
     return None
 
@@ -191,10 +214,7 @@ def get_nist_ri(cas, calc_ri):
 
 # ================= 工作表处理 =================
 def process_sheet(ws, alkanes, formula, agg, cas_col_param, name_col_param, show_progress=True):
-    """
-    处理单个工作表，计算保留指数。
-    返回 (above_rows, new_header, new_data_rows, ri_col_indices)
-    """
+    """为一个工作表计算所选公式的保留指数。"""
     max_row = ws.max_row
     max_col = ws.max_column
     rows = []
@@ -205,7 +225,6 @@ def process_sheet(ws, alkanes, formula, agg, cas_col_param, name_col_param, show
     # 检测表头行
     header_idx = detect_header_row(ws)
     header_row_vals = rows[header_idx] if header_idx < len(rows) else []
-    above_rows = rows[:header_idx]
     data_rows = rows[header_idx + 1:]
 
     # 确定名称列索引
@@ -238,19 +257,14 @@ def process_sheet(ws, alkanes, formula, agg, cas_col_param, name_col_param, show
     # 确定插入RI列的位置（名称列右侧）
     ri_insert_pos = name_col + 1
 
-    # 构建新表头
-    new_header = list(header_row_vals)
-    if formula in ("L", "K"):
-        ri_col_name = "保留指数(线性)" if formula == "L" else "保留指数(Kovats)"
-        new_header.insert(ri_insert_pos, ri_col_name)
-        ri_col_count = 1
-    else:  # B - both
-        new_header.insert(ri_insert_pos, "保留指数(Kovats)")
-        new_header.insert(ri_insert_pos + 1, "保留指数(线性)")
-        ri_col_count = 2
+    if formula == "B":
+        headers = ("保留指数(Kovats)", "保留指数(线性)")
+    elif formula == "K":
+        headers = ("保留指数(Kovats)",)
+    else:
+        headers = ("保留指数(线性)",)
 
-    # 构建新数据行
-    new_data_rows = []
+    values = []
     for row in tqdm(data_rows, desc=f"处理 {ws.title}", disable=not show_progress, unit="行"):
         # 收集该行所有有效保留时间
         rts = []
@@ -287,160 +301,39 @@ def process_sheet(ws, alkanes, formula, agg, cas_col_param, name_col_param, show
             else:
                 ri_linear = None
 
-        # 构建新行
-        new_row = list(row)
         if formula == "L":
-            new_row.insert(ri_insert_pos, ri_linear)
+            values.append((ri_linear,))
         elif formula == "K":
-            new_row.insert(ri_insert_pos, ri_kovats)
-        else:  # B
-            new_row.insert(ri_insert_pos, ri_kovats)
-            new_row.insert(ri_insert_pos + 1, ri_linear)
-        new_data_rows.append(new_row)
+            values.append((ri_kovats,))
+        else:
+            values.append((ri_kovats, ri_linear))
 
-    return above_rows, new_header, new_data_rows, cas_col, ri_insert_pos, ri_col_count
+    return (header_idx + 1, ri_insert_pos + 1, headers, values), cas_col
 
-# ================= 输出写入 =================
-def write_output(wb, sheets_results, suffix, show_progress=True):
-    """将处理结果写入新工作簿并保存。"""
-    out_wb = openpyxl.Workbook()
-    default_sheet = out_wb.active
-    out_wb.remove(default_sheet)
 
-    for sheet_name, (above_rows, new_header, new_data_rows) in tqdm(
-        sheets_results.items(), desc="写入工作表", disable=not show_progress, unit="个"
-    ):
-        out_ws = out_wb.create_sheet(title=sheet_name)
-
-        # 写入上方行
-        for r_idx, row_vals in enumerate(above_rows):
-            for c_idx, val in enumerate(row_vals):
-                if val is not None:
-                    out_ws.cell(row=r_idx + 1, column=c_idx + 1, value=val)
-
-        # 写入新表头
-        header_row_num = len(above_rows) + 1
-        for c_idx, val in enumerate(new_header):
-            if val is not None:
-                out_ws.cell(row=header_row_num, column=c_idx + 1, value=val)
-
-        # 写入数据行
-        for r_idx, row_vals in enumerate(new_data_rows):
-            row_num = header_row_num + 1 + r_idx
-            for c_idx, val in enumerate(row_vals):
-                if val is not None:
-                    out_ws.cell(row=row_num, column=c_idx + 1, value=val)
-
-    out_dir = "./output/"
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    filename = time.strftime('%Y%m%d%H%M%S', time.localtime())
-    out_path = os.path.join(out_dir, f"{filename}{suffix}.xlsx")
-    out_wb.save(out_path)
-    return out_path
-
-# ================= NIST 查询后处理 =================
-def add_nist_ri_to_file(file_path, cas_col_map, ri_insert_pos_map, ri_col_count_map):
-    """读取已保存的文件，查询NIST RI并添加新列。"""
-    wb = openpyxl.load_workbook(file_path)
-    out_wb = openpyxl.Workbook()
-    default_sheet = out_wb.active
-    out_wb.remove(default_sheet)
-
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        max_row = ws.max_row
-        max_col = ws.max_column
-
-        cas_col = cas_col_map.get(sheet_name)
-        ri_insert_pos = ri_insert_pos_map.get(sheet_name, 0)
-        ri_col_count = ri_col_count_map.get(sheet_name, 1)
-
+def add_nist_ri(workbook, sheet_positions, append):
+    """在已经计算 RI 的工作表中加入 NIST 对照列。"""
+    for sheet_name, (header_row, ri_col, ri_count, cas_col) in sheet_positions.items():
         if cas_col is None:
-            # 没有CAS列，直接复制
-            out_ws = out_wb.create_sheet(title=sheet_name)
-            for r in range(1, max_row + 1):
-                for c in range(1, max_col + 1):
-                    val = ws.cell(row=r, column=c).value
-                    if val is not None:
-                        out_ws.cell(row=r, column=c, value=val)
             continue
-
-        # 找到RI列中可用于对比的值（取第一个RI列）
-        ri_col_for_compare = ri_insert_pos  # 第一个RI列的0-based索引
-
-        # 读取所有行
-        rows = []
-        for r in range(1, max_row + 1):
-            row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-            rows.append(row_vals)
-
-        # 检测表头行
-        header_idx = detect_header_row(ws)
-
-        # NIST RI插入位置：在最后一个RI列之后
-        nist_insert_pos = ri_insert_pos + ri_col_count  # 0-based index
-
-        # 构建新表头
-        new_header = list(rows[header_idx])
-        new_header.insert(nist_insert_pos, "NIST RI")
-
-        # 构建新数据行
-        new_data_rows = []
-        data_rows = rows[header_idx + 1:]
-        for r_idx, row in enumerate(tqdm(data_rows, desc=f"NIST查询 {sheet_name}", unit="行")):
-            cas_val = row[cas_col] if cas_col < len(row) else None
-            ri_val = row[ri_col_for_compare] if ri_col_for_compare < len(row) else None
-
-            # 获取用于对比的RI值
-            calc_ri_for_compare = None
-            if ri_val is not None:
-                try:
-                    calc_ri_for_compare = float(ri_val)
-                except (ValueError, TypeError):
-                    pass
-
-            if cas_val and calc_ri_for_compare is not None and calc_ri_for_compare > 0:
-                nist_ri = get_nist_ri(cas_val, calc_ri_for_compare)
-                print(f"  [{r_idx+1}] CAS: {cas_val} | 计算RI: {calc_ri_for_compare} | NIST RI: {nist_ri}")
+        sheet = workbook[sheet_name]
+        values = []
+        rows = range(header_row + 1, sheet.max_row + 1)
+        for row in tqdm(rows, desc=f"NIST查询 {sheet_name}", unit="行"):
+            cas = sheet.cell(row, cas_col).value
+            result = ""
+            try:
+                ri = float(sheet.cell(row, ri_col).value)
+            except (ValueError, TypeError):
+                ri = 0
+            if cas and ri > 0:
+                result = get_nist_ri(cas, ri)
+                print(f"  [{row - header_row}] CAS: {cas} | 计算RI: {ri} | NIST RI: {result}")
                 time.sleep(1)
-            else:
-                nist_ri = ""
+            values.append((result,))
+        write_columns(sheet, header_row, ri_col + ri_count, ("NIST RI",), values, append=append)
 
-            new_row = list(row)
-            new_row.insert(nist_insert_pos, nist_ri)
-            new_data_rows.append(new_row)
 
-        # 写入
-        out_ws = out_wb.create_sheet(title=sheet_name)
-        above_rows = rows[:header_idx]
-        for r_idx, row_vals in enumerate(above_rows):
-            for c_idx, val in enumerate(row_vals):
-                if val is not None:
-                    out_ws.cell(row=r_idx + 1, column=c_idx + 1, value=val)
-
-        header_row_num = len(above_rows) + 1
-        for c_idx, val in enumerate(new_header):
-            if val is not None:
-                out_ws.cell(row=header_row_num, column=c_idx + 1, value=val)
-
-        for r_idx, row_vals in enumerate(new_data_rows):
-            row_num = header_row_num + 1 + r_idx
-            for c_idx, val in enumerate(row_vals):
-                if val is not None:
-                    out_ws.cell(row=row_num, column=c_idx + 1, value=val)
-
-    # 保存
-    out_dir = "./output/"
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    filename = time.strftime('%Y%m%d%H%M%S', time.localtime())
-    out_path = os.path.join(out_dir, f"{filename}_with_RI_NIST.xlsx")
-    out_wb.save(out_path)
-    wb.close()
-    return out_path
-
-# ================= 主程序 =================
 def main():
     option = json.loads(sys.argv[1])
     file = option["File"]
@@ -450,11 +343,9 @@ def main():
 
     # 解析Para1：参考文件路径
     if not para1:
-        print("错误：请提供正构烷烃参考文件路径（Para1）。")
-        return
+        raise ValueError("请提供正构烷烃参考文件路径（Para1）。")
     if not os.path.exists(para1):
-        print(f"错误：参考文件不存在: {para1}")
-        return
+        raise ValueError(f"参考文件不存在: {para1}")
 
     # 解析Para2：公式和聚合方式
     if para2:
@@ -474,66 +365,46 @@ def main():
         if len(parts) >= 2 and parts[1]:
             name_col_param = parts[1].upper()
 
-    # 加载正构烷烃参考数据
-    try:
-        alkanes = load_alkanes(para1)
-        print(f"已加载 {len(alkanes)} 个正构烷烃数据（碳数 {alkanes[0][0]}-{alkanes[-1][0]}）")
-    except Exception as e:
-        print(f"错误：加载参考文件失败 - {e}")
-        return
-
-    # 读取输入文件
-    if not os.path.exists(file):
-        print(f"错误：输入文件不存在: {file}")
-        return
+    alkanes = load_alkanes(para1)
+    print(f"已加载 {len(alkanes)} 个正构烷烃数据（碳数 {alkanes[0][0]}-{alkanes[-1][0]}）")
 
     wb = openpyxl.load_workbook(file)
-    sheets_results = {}
-    cas_col_map = {}
-    ri_insert_pos_map = {}
-    ri_col_count_map = {}
+    try:
+        append = should_append_columns(wb)
+        positions = {}
 
-    # 处理每个工作表
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        try:
-            above_rows, new_header, new_data_rows, cas_col, ri_insert_pos, ri_col_count = process_sheet(
-                ws, alkanes, formula, agg, cas_col_param, name_col_param
+        def process(ws):
+            columns, cas_col = process_sheet(ws, alkanes, formula, agg, cas_col_param, name_col_param)
+            header_row, _, headers, _ = columns
+            ri_col = write_columns(ws, *columns, append=append)
+            if cas_col is not None:
+                cas_col += 1
+                if cas_col >= ri_col:
+                    cas_col += len(headers)
+            positions[ws.title] = (header_row, ri_col, len(headers), cas_col)
+
+        process_workbook(wb, process)
+        out_path = save_workbook(wb, "_with_RI")
+        print(f"RI计算完成！文件保存至：{out_path}")
+
+        if any(position[-1] is not None for position in positions.values()):
+            app = QApplication.instance() or QApplication(sys.argv)
+            reply = QMessageBox.question(
+                None, "NIST RI 查询",
+                "RI计算完成！是否查询NIST数据库进行RI对比？\n\n（查询过程较慢，每条约1秒）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
-            sheets_results[sheet_name] = (above_rows, new_header, new_data_rows)
-            cas_col_map[sheet_name] = cas_col
-            ri_insert_pos_map[sheet_name] = ri_insert_pos
-            ri_col_count_map[sheet_name] = ri_col_count
-        except ValueError as e:
-            print(f"工作表 '{sheet_name}' 处理失败: {e}")
-            continue
+            if reply == QMessageBox.Yes:
+                print("开始NIST查询（每条约1秒，请耐心等待）...")
+                add_nist_ri(wb, positions, append)
+                out_path = save_workbook(wb, "_with_RI_NIST")
+                print(f"NIST查询完成！最终文件保存至：{out_path}")
+        else:
+            print("未检测到CAS号列，跳过NIST查询。")
+        report_output(out_path)
+    finally:
+        wb.close()
 
-    wb.close()
-
-    if not sheets_results:
-        print("错误：没有成功处理任何工作表。")
-        return
-
-    # 写入第一阶段结果
-    out_path = write_output(wb=None, sheets_results=sheets_results, suffix="_with_RI")
-    print(f"\nRI计算完成！文件保存至：{out_path}")
-
-    # 询问是否查询NIST
-    has_cas = any(v is not None for v in cas_col_map.values())
-    if has_cas:
-        app = QApplication.instance() or QApplication(sys.argv)
-        reply = QMessageBox.question(
-            None, "NIST RI 查询",
-            "RI计算完成！是否查询NIST数据库进行RI对比？\n\n（查询过程较慢，每条约1秒）",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
-        if reply == QMessageBox.Yes:
-            print("\n开始NIST查询（每条约1秒，请耐心等待）...")
-            nist_path = add_nist_ri_to_file(out_path, cas_col_map, ri_insert_pos_map, ri_col_count_map)
-            print(f"\nNIST查询完成！最终文件保存至：{nist_path}")
-    else:
-        print("\n（未检测到CAS号列，跳过NIST查询。如需NIST查询，请通过Para3指定CAS列位置。）")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run_script(main))

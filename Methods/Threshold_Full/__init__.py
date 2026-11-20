@@ -14,7 +14,7 @@ import os
 import sys
 import json
 import re
-import time
+from pathlib import Path
 import openpyxl
 from tqdm import tqdm
 from PyQt5.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout,
@@ -23,50 +23,21 @@ from PyQt5.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout,
                               QAbstractItemView, QMessageBox)
 from PyQt5.QtCore import Qt
 
-# ================= 列字母工具 =================
-def col_letters():
-    for c in range(1, 1000):
-        n = c
-        s = ''
-        while n:
-            n -= 1
-            s = chr(ord('A') + n % 26) + s
-            n //= 26
-        yield s
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-HEAD = list(col_letters())[:256]
+from method_support import (
+    MethodCancelled, find_header_row, is_cas_header, process_workbook, report_output,
+    run_script, save_workbook, should_append_columns, worksheet_column, write_columns,
+)
 
-# ================= 表头识别关键词 =================
-TIME_KEYWORDS = ('保留时间', '时间', 'time')
+
 NAME_KEYWORDS = ('名称', 'name', 'compound', 'compounds')
-CAS_KEYWORDS = ('cas', 'cas号', 'cas number')
 
-def is_time_header(val):
-    if val is None:
-        return False
-    s = str(val).strip()
-    return bool(s) and any(kw in s.lower() for kw in TIME_KEYWORDS)
 
-def is_name_header(val):
-    if val is None:
-        return False
-    s = str(val).strip()
-    return bool(s) and any(kw in s.lower() for kw in NAME_KEYWORDS)
+def is_name_header(value):
+    return isinstance(value, str) and any(word in value.strip().lower() for word in NAME_KEYWORDS)
 
-def is_cas_header(val):
-    if val is None:
-        return False
-    s = str(val).strip()
-    return bool(s) and any(kw in s.lower() for kw in CAS_KEYWORDS)
-
-def detect_header_row(ws, max_rows=20):
-    for r in range(min(max_rows, ws.max_row)):
-        row_vals = [cell.value for cell in ws[r + 1]]
-        has_time = any(is_time_header(v) for v in row_vals)
-        has_name = any(is_name_header(v) for v in row_vals)
-        if has_time and has_name:
-            return r
-    return 0
 
 # ================= 数据库加载 =================
 def load_full_thresholds(json_path="./Database/Threshold_full.json"):
@@ -140,15 +111,15 @@ def get_latest_threshold(thresholds):
     return latest[0] if latest else thresholds[0]
 
 def filter_by_type(thresholds, type_filter):
-    """按类型筛选阈值"""
-    if not type_filter or type_filter == '全部':
+    """Only include records of the selected type."""
+    if not type_filter or type_filter == "全部":
         return thresholds
-    result = []
-    for t in thresholds:
-        t_type = (t.get('type') or '').strip().lower()
-        if not t_type or t_type == type_filter.lower():
-            result.append(t)
-    return result
+    selected = type_filter.strip().casefold()
+    return [
+        record for record in thresholds
+        if (record.get("type") or "").strip().casefold() == selected
+    ]
+
 
 # ================= PyQt5 窗口 =================
 class CustomModeWindow(QDialog):
@@ -322,6 +293,21 @@ def find_columns(header_row_vals):
             name_col = i
     return cas_col, name_col
 
+def threshold_columns(sheet, cas_col_param, *, use_cas=True, use_name=True):
+    explicit_cas = worksheet_column(sheet, cas_col_param) if use_cas else None
+    header = None
+    if use_cas:
+        header = find_header_row(sheet, is_cas_header, column=explicit_cas, fallback=None)
+    if header is None:
+        header = find_header_row(sheet, is_name_header) if use_name else 0
+
+    rows = sheet.iter_rows(min_row=header + 1, values_only=True)
+    cas_col, name_col = find_columns(next(rows, ()))
+    if explicit_cas is not None:
+        cas_col = explicit_cas
+    return header, rows, cas_col if use_cas else None, name_col if use_name else None
+
+
 def lookup_by_cas(cas_val, cas_index):
     if not cas_val:
         return None
@@ -336,43 +322,20 @@ def lookup_by_name(name_val, name_index):
 
 def process_default_mode(ws, cas_col_param, cas_index, name_index):
     """默认模式：自动匹配最新阈值"""
-    max_row = ws.max_row
-    max_col = ws.max_column
-    rows = []
-    for r in range(1, max_row + 1):
-        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-        rows.append(row_vals)
+    header_idx, data_rows, cas_col, name_col = threshold_columns(ws, cas_col_param)
+    if cas_col is None and name_col is None:
+        raise ValueError("未找到 CAS 或名称列，请检查表头或通过参数1指定 CAS 列。")
+    insert_col = (cas_col if cas_col is not None else name_col) + 2
 
-    header_idx = detect_header_row(ws)
-    header_row_vals = rows[header_idx] if header_idx < len(rows) else []
-    above_rows = rows[:header_idx]
-    data_rows = rows[header_idx + 1:]
-
-    auto_cas_col, auto_name_col = find_columns(header_row_vals)
-    if cas_col_param:
-        cas_col = HEAD.index(cas_col_param.upper())
-    else:
-        cas_col = auto_cas_col
-        if cas_col is None:
-            raise ValueError("未找到 CAS 列，请通过参数1指定列字母。")
-
-    name_col = auto_name_col
-
-    new_header = list(header_row_vals)
-    insert_pos = cas_col + 1
-    new_header.insert(insert_pos, "嗅觉阈值(mg/L)")
-
-    new_data_rows = []
+    values = []
     stats = {'matched': 0, 'not_found': 0}
 
     for row in tqdm(data_rows, desc="处理数据", unit="行"):
-        cas_val = row[cas_col] if cas_col < len(row) else None
+        cas_val = row[cas_col] if cas_col is not None else None
         name_val = row[name_col] if name_col is not None and name_col < len(row) else None
 
         if cas_val is None and name_val is None:
-            new_row = list(row)
-            new_row.insert(insert_pos, "")
-            new_data_rows.append(new_row)
+            values.append(("",))
             continue
 
         compound = lookup_by_cas(cas_val, cas_index)
@@ -380,158 +343,97 @@ def process_default_mode(ws, cas_col_param, cas_index, name_index):
             compound = lookup_by_name(name_val, name_index)
 
         if compound is None:
-            new_row = list(row)
-            new_row.insert(insert_pos, "Not Found")
-            new_data_rows.append(new_row)
+            values.append(("Not Found",))
             stats['not_found'] += 1
             continue
 
         thresholds = compound.get('thresholds', [])
         if not thresholds:
-            new_row = list(row)
-            new_row.insert(insert_pos, "No Data")
-            new_data_rows.append(new_row)
+            values.append(("No Data",))
             continue
 
         latest = get_latest_threshold(thresholds)
-        new_row = list(row)
-        new_row.insert(insert_pos, str(latest.get('value', '')) if latest else "No Data")
-        new_data_rows.append(new_row)
+        values.append((str(latest.get('value', '')) if latest else "No Data",))
         stats['matched'] += 1
 
-    return above_rows, new_header, new_data_rows, stats
+    return (header_idx + 1, insert_col, ("嗅觉阈值(mg/L)",), values), stats
 
 def process_custom_mode(ws, cas_col_param, cas_index, name_index, settings):
     """自定义模式：根据用户设置筛选"""
-    max_row = ws.max_row
-    max_col = ws.max_column
-    rows = []
-    for r in range(1, max_row + 1):
-        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-        rows.append(row_vals)
+    use_cas = bool(cas_col_param) or settings['match_mode'] == 'cas'
+    header_idx, data_rows, cas_col, name_col = threshold_columns(
+        ws, cas_col_param, use_cas=use_cas, use_name=not use_cas,
+    )
+    lookup_col = cas_col if use_cas else name_col
+    if lookup_col is None:
+        raise ValueError(f"未找到{'CAS' if use_cas else '名称'}列，请检查表头。")
 
-    header_idx = detect_header_row(ws)
-    header_row_vals = rows[header_idx] if header_idx < len(rows) else []
-    above_rows = rows[:header_idx]
-    data_rows = rows[header_idx + 1:]
-
-    if cas_col_param:
-        lookup_col = HEAD.index(cas_col_param.upper())
-        lookup_mode = 'cas'
-    else:
-        cas_col, name_col = find_columns(header_row_vals)
-        if settings['match_mode'] == 'cas':
-            lookup_col = cas_col
-            lookup_mode = 'cas'
-        else:
-            lookup_col = name_col
-            lookup_mode = 'name'
-        if lookup_col is None:
-            raise ValueError(f"未找到{'CAS' if lookup_mode == 'cas' else '名称'}列，请通过参数1指定。")
-
-    new_header = list(header_row_vals)
-    insert_pos = lookup_col + 1
-    new_header.insert(insert_pos, "嗅觉阈值(mg/L)")
-
-    new_data_rows = []
+    values = []
     stats = {'matched': 0, 'not_found': 0}
 
     for row in tqdm(data_rows, desc="处理数据", unit="行"):
         lookup_val = row[lookup_col] if lookup_col < len(row) else None
 
         if lookup_val is None:
-            new_row = list(row)
-            new_row.insert(insert_pos, "")
-            new_data_rows.append(new_row)
+            values.append(("",))
             continue
 
-        if lookup_mode == 'cas':
+        if use_cas:
             compound = lookup_by_cas(lookup_val, cas_index)
         else:
             compound = lookup_by_name(lookup_val, name_index)
 
         if compound is None:
-            new_row = list(row)
-            new_row.insert(insert_pos, "Not Found")
-            new_data_rows.append(new_row)
+            values.append(("Not Found",))
             stats['not_found'] += 1
             continue
 
         thresholds = compound.get('thresholds', [])
         if not thresholds:
-            new_row = list(row)
-            new_row.insert(insert_pos, "No Data")
-            new_data_rows.append(new_row)
+            values.append(("No Data",))
             continue
 
         filtered = filter_by_type(thresholds, settings.get('type_filter'))
-
         value_mode = settings.get('value_mode', 'latest')
         if value_mode == 'latest':
-            result = get_latest_threshold(filtered)
-            value = str(result.get('value', '')) if result else "No Match"
+            latest = get_latest_threshold(filtered)
+            value = latest.get('value') if latest else None
         elif value_mode == 'max':
-            value = str(get_max_value(filtered)) if filtered else "No Match"
+            value = get_max_value(filtered)
         else:
-            value = str(get_min_value(filtered)) if filtered else "No Match"
+            value = get_min_value(filtered)
+        if value is None:
+            values.append(("No Match",))
+            stats['not_found'] += 1
+        else:
+            values.append((str(value),))
+            stats['matched'] += 1
 
-        new_row = list(row)
-        new_row.insert(insert_pos, value)
-        new_data_rows.append(new_row)
-        stats['matched'] += 1
+    return (header_idx + 1, lookup_col + 2, ("嗅觉阈值(mg/L)",), values), stats
 
-    return above_rows, new_header, new_data_rows, stats
 
 def process_manual_mode(ws, cas_col_param, cas_index, name_index, settings):
     """手动模式：用户逐行选择"""
-    max_row = ws.max_row
-    max_col = ws.max_column
-    rows = []
-    for r in range(1, max_row + 1):
-        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-        rows.append(row_vals)
+    use_cas = settings.get('use_cas', True)
+    use_name = settings.get('use_name', True)
+    header_idx, data_rows, cas_col, name_col = threshold_columns(
+        ws, cas_col_param, use_cas=use_cas, use_name=use_name,
+    )
+    if cas_col is None and name_col is None:
+        raise ValueError("未找到可用于匹配的 CAS 或名称列。")
+    insert_col = (cas_col if cas_col is not None else name_col) + 2
 
-    header_idx = detect_header_row(ws)
-    header_row_vals = rows[header_idx] if header_idx < len(rows) else []
-    above_rows = rows[:header_idx]
-    data_rows = rows[header_idx + 1:]
-
-    auto_cas_col, auto_name_col = find_columns(header_row_vals)
-    if cas_col_param:
-        cas_col = HEAD.index(cas_col_param.upper())
-    else:
-        cas_col = auto_cas_col
-    name_col = auto_name_col
-
-    insert_col = cas_col if cas_col is not None else (name_col if name_col is not None else 0)
-    insert_pos = insert_col + 1
-
-    new_header = list(header_row_vals)
-    new_header.insert(insert_pos, "嗅觉阈值(mg/L)")
-
-    new_data_rows = []
+    values = []
     stats = {'matched': 0, 'not_found': 0, 'skipped': 0}
-    cancelled = False
-
     for row in tqdm(data_rows, desc="处理数据", unit="行"):
-        if cancelled:
-            new_row = list(row)
-            new_row.insert(insert_pos, "")
-            new_data_rows.append(new_row)
-            continue
-
         cas_val = row[cas_col] if cas_col is not None and cas_col < len(row) else None
         name_val = row[name_col] if name_col is not None and name_col < len(row) else None
 
         if cas_val is None and name_val is None:
-            new_row = list(row)
-            new_row.insert(insert_pos, "")
-            new_data_rows.append(new_row)
+            values.append(("",))
             continue
 
         compound = None
-        use_cas = settings.get('use_cas', True)
-        use_name = settings.get('use_name', True)
 
         if use_cas and cas_val:
             compound = lookup_by_cas(cas_val, cas_index)
@@ -539,17 +441,13 @@ def process_manual_mode(ws, cas_col_param, cas_index, name_index, settings):
             compound = lookup_by_name(name_val, name_index)
 
         if compound is None:
-            new_row = list(row)
-            new_row.insert(insert_pos, "Not Found")
-            new_data_rows.append(new_row)
+            values.append(("Not Found",))
             stats['not_found'] += 1
             continue
 
         thresholds = compound.get('thresholds', [])
         if not thresholds:
-            new_row = list(row)
-            new_row.insert(insert_pos, "No Data")
-            new_data_rows.append(new_row)
+            values.append(("No Data",))
             continue
 
         compound_name = compound.get('chinese_name') or compound.get('english_name', '')
@@ -557,178 +455,63 @@ def process_manual_mode(ws, cas_col_param, cas_index, name_index, settings):
         dialog = ManualModeDialog(compound_name, cas_number, thresholds)
         result = dialog.exec_()
 
-        if result == QDialog.Rejected:
-            cancelled = True
-            new_row = list(row)
-            new_row.insert(insert_pos, "")
-            new_data_rows.append(new_row)
-            continue
+        if result != QDialog.Accepted:
+            raise MethodCancelled()
 
         selected_value = dialog.get_selected_values()
-        new_row = list(row)
-        new_row.insert(insert_pos, selected_value)
-        new_data_rows.append(new_row)
+        values.append((selected_value,))
 
         if selected_value == "Skipped":
             stats['skipped'] += 1
         else:
             stats['matched'] += 1
 
-    return above_rows, new_header, new_data_rows, stats
+    return (header_idx + 1, insert_col, ("嗅觉阈值(mg/L)",), values), stats
 
 # ================= 主程序 =================
 def main():
     option = json.loads(sys.argv[1])
-    file_path = option["File"]
-    para1 = option.get("Para1", "")
+    para1 = option.get("Para1", "").strip()
     para2 = option.get("Para2", "").strip().lower()
+    all_compounds, cas_index, name_index = load_full_thresholds()
+    print(f"已加载阈值数据库: {len(all_compounds)} 个化合物")
 
-    db_path = "./Database/Threshold_full.json"
-    try:
-        all_compounds, cas_index, name_index = load_full_thresholds(db_path)
-        print(f"已加载阈值数据库: {len(all_compounds)} 个化合物")
-    except FileNotFoundError as e:
-        print(f"错误: {e}")
-        return
-
-    if para2 in ('c', 'custom'):
-        mode = 'custom'
-    elif para2 in ('m', 'manual'):
-        mode = 'manual'
+    if para2 in ("c", "custom"):
+        mode, dialog_type, calculate = "custom", CustomModeWindow, process_custom_mode
+    elif para2 in ("m", "manual"):
+        mode, dialog_type, calculate = "manual", ManualModeSettingsWindow, process_manual_mode
     else:
-        mode = 'default'
-
+        mode, dialog_type, calculate = "default", None, process_default_mode
     print(f"运行模式: {mode}")
 
-    wb = openpyxl.load_workbook(file_path)
-    out_wb = openpyxl.Workbook()
-    default_sheet = out_wb.active
-    out_wb.remove(default_sheet)
-
-    total_stats = {'matched': 0, 'not_found': 0, 'skipped': 0}
-
-    if mode == 'custom':
+    extra_args = ()
+    if dialog_type is not None:
         app = QApplication.instance() or QApplication(sys.argv)
-        settings_window = CustomModeWindow()
-        if settings_window.exec_() != QDialog.Accepted:
-            print("用户取消操作")
-            return
-        settings = settings_window.get_settings()
-        print(f"筛选设置: {settings}")
+        dialog = dialog_type()
+        if dialog.exec_() != QDialog.Accepted:
+            raise MethodCancelled()
+        extra_args = (dialog.get_settings(),)
 
-        for sheet_name in tqdm(wb.sheetnames, desc="处理工作表", unit="个"):
-            ws = wb[sheet_name]
-            try:
-                above_rows, new_header, new_data_rows, stats = process_custom_mode(
-                    ws, para1, cas_index, name_index, settings)
-            except ValueError as e:
-                print(f"工作表 '{sheet_name}' 处理失败: {e}")
-                continue
+    total_stats = {"matched": 0, "not_found": 0, "skipped": 0}
+    wb = openpyxl.load_workbook(option["File"])
+    try:
+        append = should_append_columns(wb)
 
-            for k in total_stats:
-                total_stats[k] += stats.get(k, 0)
+        def process(ws):
+            columns, stats = calculate(ws, para1, cas_index, name_index, *extra_args)
+            write_columns(ws, *columns, append=append)
+            for key in total_stats:
+                total_stats[key] += stats.get(key, 0)
+            print(f"  工作表 '{ws.title}': 匹配 {stats['matched']}, 未找到 {stats['not_found']}")
 
-            out_ws = out_wb.create_sheet(title=sheet_name)
-            for r_idx, row_vals in enumerate(above_rows):
-                for c_idx, val in enumerate(row_vals):
-                    if val is not None:
-                        out_ws.cell(row=r_idx + 1, column=c_idx + 1, value=val)
-            header_row_num = len(above_rows) + 1
-            for c_idx, val in enumerate(new_header):
-                if val is not None:
-                    out_ws.cell(row=header_row_num, column=c_idx + 1, value=val)
-            for r_idx, row_vals in enumerate(new_data_rows):
-                row_num = header_row_num + 1 + r_idx
-                for c_idx, val in enumerate(row_vals):
-                    if val is not None:
-                        out_ws.cell(row=row_num, column=c_idx + 1, value=val)
+        process_workbook(wb, process)
+        out_path = save_workbook(wb, "_threshold_full")
+        print(f"匹配 {total_stats['matched']}，未找到 {total_stats['not_found']}，跳过 {total_stats['skipped']}")
+        print(f"处理完成，文件保存至：{out_path}")
+        report_output(out_path)
+    finally:
+        wb.close()
 
-            print(f"  工作表 '{sheet_name}': 匹配 {stats['matched']}, 未找到 {stats['not_found']}")
-
-    elif mode == 'manual':
-        app = QApplication.instance() or QApplication(sys.argv)
-        settings_window = ManualModeSettingsWindow()
-        if settings_window.exec_() != QDialog.Accepted:
-            print("用户取消操作")
-            return
-        settings = settings_window.get_settings()
-        print(f"匹配设置: CAS={'是' if settings['use_cas'] else '否'}, 名称={'是' if settings['use_name'] else '否'}")
-
-        for sheet_name in tqdm(wb.sheetnames, desc="处理工作表", unit="个"):
-            ws = wb[sheet_name]
-            try:
-                above_rows, new_header, new_data_rows, stats = process_manual_mode(
-                    ws, para1, cas_index, name_index, settings)
-            except ValueError as e:
-                print(f"工作表 '{sheet_name}' 处理失败: {e}")
-                continue
-
-            for k in total_stats:
-                total_stats[k] += stats.get(k, 0)
-
-            out_ws = out_wb.create_sheet(title=sheet_name)
-            for r_idx, row_vals in enumerate(above_rows):
-                for c_idx, val in enumerate(row_vals):
-                    if val is not None:
-                        out_ws.cell(row=r_idx + 1, column=c_idx + 1, value=val)
-            header_row_num = len(above_rows) + 1
-            for c_idx, val in enumerate(new_header):
-                if val is not None:
-                    out_ws.cell(row=header_row_num, column=c_idx + 1, value=val)
-            for r_idx, row_vals in enumerate(new_data_rows):
-                row_num = header_row_num + 1 + r_idx
-                for c_idx, val in enumerate(row_vals):
-                    if val is not None:
-                        out_ws.cell(row=row_num, column=c_idx + 1, value=val)
-
-            print(f"  工作表 '{sheet_name}': 匹配 {stats['matched']}, 未找到 {stats['not_found']}, 跳过 {stats['skipped']}")
-
-    else:
-        for sheet_name in tqdm(wb.sheetnames, desc="处理工作表", unit="个"):
-            ws = wb[sheet_name]
-            try:
-                above_rows, new_header, new_data_rows, stats = process_default_mode(
-                    ws, para1, cas_index, name_index)
-            except ValueError as e:
-                print(f"工作表 '{sheet_name}' 处理失败: {e}")
-                continue
-
-            for k in total_stats:
-                total_stats[k] += stats.get(k, 0)
-
-            out_ws = out_wb.create_sheet(title=sheet_name)
-            for r_idx, row_vals in enumerate(above_rows):
-                for c_idx, val in enumerate(row_vals):
-                    if val is not None:
-                        out_ws.cell(row=r_idx + 1, column=c_idx + 1, value=val)
-            header_row_num = len(above_rows) + 1
-            for c_idx, val in enumerate(new_header):
-                if val is not None:
-                    out_ws.cell(row=header_row_num, column=c_idx + 1, value=val)
-            for r_idx, row_vals in enumerate(new_data_rows):
-                row_num = header_row_num + 1 + r_idx
-                for c_idx, val in enumerate(row_vals):
-                    if val is not None:
-                        out_ws.cell(row=row_num, column=c_idx + 1, value=val)
-
-            print(f"  工作表 '{sheet_name}': 匹配 {stats['matched']}, 未找到 {stats['not_found']}")
-
-    out_dir = "./output/"
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    filename = time.strftime('%Y%m%d%H%M%S', time.localtime())
-    out_path = os.path.join(out_dir, f"{filename}_threshold_full.xlsx")
-    out_wb.save(out_path)
-
-    print()
-    print("=" * 50)
-    print(f"处理完成!")
-    print(f"  匹配: {total_stats['matched']}")
-    print(f"  未找到: {total_stats['not_found']}")
-    if total_stats.get('skipped'):
-        print(f"  跳过: {total_stats['skipped']}")
-    print(f"  文件保存至: {out_path}")
-    print("=" * 50)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run_script(main))

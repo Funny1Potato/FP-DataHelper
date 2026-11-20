@@ -1,25 +1,22 @@
-import os
 import openpyxl
-import time
 import sys
 import json
-from collections import defaultdict, Counter
-import re
-from tqdm import tqdm   # 导入 tqdm
+from copy import copy
+from math import isfinite
+from pathlib import Path
+
+from openpyxl.utils import get_column_letter
+from tqdm import tqdm
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from method_support import (
+    prepare_sort_values, process_workbook, report_output, require_saved_sort_values,
+    run_script, save_workbook,
+)
 
 # 列字母生成器（最多支持 3 个字母）
-def col_letters():
-    for c in range(1, 1000):
-        n = c
-        s = ''
-        while n:
-            n -= 1
-            s = chr(ord('A') + n % 26) + s
-            n //= 26
-        yield s
-
-HEAD = list(col_letters())[:256]   # 足够覆盖常见列数
-
 # 关键词（不区分大小写）
 TIME_KEYWORDS = ('保留时间', '时间', 'time')
 NAME_KEYWORDS = ('名称', 'name', 'compound', 'compounds')
@@ -54,27 +51,35 @@ def detect_header_row(ws, max_rows=20):
     return 0
 
 def detect_groups(header_row_vals, count_param=None):
-    """
-    自动识别分组，返回 groups 和 count。
-    若识别失败且未提供 count_param，则抛出 ValueError。
-    """
+    """手动指定时按固定组宽切分，否则按表头推断分组。"""
     total_cols = len(header_row_vals)
+    if count_param is not None:
+        if count_param < 2 or total_cols == 0 or total_cols % count_param:
+            raise ValueError("每组至少要有两列，数据列数必须是指定组宽的整数倍。")
+        groups = []
+        for start in range(0, total_cols, count_param):
+            cols = list(range(start, start + count_param))
+            times = [col for col in cols if is_time_header(header_row_vals[col])]
+            names = [col for col in cols if is_name_header(header_row_vals[col])]
+            if len(times) == len(names) == 1 and times[0] != names[0]:
+                time_col, name_col = times[0], names[0]
+            else:
+                time_col, name_col = cols[:2]
+            groups.append({
+                'time_col': time_col,
+                'name_col': name_col,
+                'other_cols': [col for col in cols if col not in (time_col, name_col)],
+            })
+        return groups, count_param
+
     time_idxs = [i for i, v in enumerate(header_row_vals) if is_time_header(v)]
     name_idxs = [i for i, v in enumerate(header_row_vals) if is_name_header(v)]
-
-    if not time_idxs:
-        raise ValueError("未找到任何时间列（表头包含'保留时间/时间/time'），无法自动分组。")
-
-    # 确定每组列数 count
-    if len(time_idxs) >= 2:
-        gaps = [time_idxs[i+1] - time_idxs[i] for i in range(len(time_idxs)-1)]
-        counter = Counter(gaps)
-        count = counter.most_common(1)[0][0]
-    else:
-        # 只有一个时间列，必须手动指定 count
-        if count_param is None:
-            raise ValueError("仅识别到单个时间列，无法自动确定分组列数，请指定每组列数。")
-        count = count_param
+    if len(time_idxs) < 2:
+        raise ValueError("自动分组需要至少两组时间列，请检查表头或手动指定每组列数。")
+    gaps = [right - left for left, right in zip(time_idxs, time_idxs[1:])]
+    count = gaps[0]
+    if any(gap != count for gap in gaps):
+        raise ValueError("时间列间距不一致，请检查表头或手动指定每组列数。")
 
     # 尝试确定时间列在组内的偏移 offset（0-based），使得每组恰好包含一个名称列且偏移一致
     possible_offsets = []
@@ -125,57 +130,32 @@ def detect_groups(header_row_vals, count_param=None):
             'time_col': time_col,
             'name_col': name_col,
             'other_cols': other_cols,
-            'start': start,
-            'count': count
         })
     return groups, count
 
 def process_sheet(ws, dev, count_param, show_progress=True):
-    """
-    处理单个工作表，返回新表头、上方行、数据行。
-    """
-    # 1. 获取所有行值（保留 None）
-    max_row = ws.max_row
-    max_col = ws.max_column
-    rows = []
-    for r in range(1, max_row+1):
-        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
-        rows.append(row_vals)
-
-    # 2. 检测表头行
+    """计算新表头、对齐数据，以及原始单元格位置。"""
+    rows = list(ws.values)
     header_row_idx = detect_header_row(ws)
-    header_row_vals = rows[header_row_idx] if header_row_idx < len(rows) else []
-    # 上方行（0 ~ header_row_idx-1）
-    above_rows = rows[:header_row_idx]
-
-    # 3. 识别分组
-    groups, count = detect_groups(header_row_vals, count_param)
-    if not groups:
-        # 若仍失败，强制默认单组（列数为 count）
-        count = count_param if count_param is not None else 4
-        total_cols = len(header_row_vals)
-        groups = []
-        for start in range(0, total_cols, count):
-            if start + count > total_cols:
-                break
-            group_cols = list(range(start, start+count))
-            # 尝试找名称列
-            name_col = None
-            for c in group_cols:
-                if is_name_header(header_row_vals[c]):
-                    name_col = c
-                    break
-            if name_col is None:
-                name_col = group_cols[1] if len(group_cols)>1 else group_cols[0]
-            time_col = group_cols[0]  # 默认第一列为时间
-            other_cols = [c for c in group_cols if c != time_col and c != name_col]
-            groups.append({
-                'time_col': time_col,
-                'name_col': name_col,
-                'other_cols': other_cols,
-                'start': start,
-                'count': count
-            })
+    relevant_rows = rows[header_row_idx:]
+    header_row_vals = rows[header_row_idx]
+    if count_param is not None and count_param >= 2:
+        width = max(
+            (index + 1 for row in relevant_rows for index, value in enumerate(row) if value is not None),
+            default=0,
+        )
+        padded_width = ((width + count_param - 1) // count_param) * count_param
+        if padded_width <= len(header_row_vals):
+            width = padded_width
+        header_row_vals = header_row_vals[:width]
+    groups, _ = detect_groups(header_row_vals, count_param)
+    columns = {
+        col for group in groups
+        for col in (group['time_col'], group['name_col'], *group['other_cols'])
+    }
+    if any(value is not None and col not in columns
+           for row in relevant_rows for col, value in enumerate(row)):
+        raise ValueError("检测到未归入任何组的数据，请检查分组。")
 
     # 4. 提取数据（从表头行下一行开始）
     data_rows = rows[header_row_idx+1:]
@@ -192,7 +172,9 @@ def process_sheet(ws, dev, count_param, show_progress=True):
             # 时间转为浮点
             try:
                 t = float(time_val)
-            except:
+            except (ValueError, TypeError):
+                continue
+            if not isfinite(t):
                 continue
             name = str(name_val).strip()
             # 其他列值
@@ -201,8 +183,12 @@ def process_sheet(ws, dev, count_param, show_progress=True):
                 'group': g_idx,
                 'time': t,
                 'name': name,
-                'others': others
+                'others': others,
+                'row': header_row_idx + r_idx + 2,
             })
+
+    if not records:
+        raise ValueError("未找到具有有效保留时间和名称的数据。")
 
     # 5. 对齐（按时间排序，按名称和时间差匹配）
     records.sort(key=lambda x: x['time'])
@@ -216,109 +202,120 @@ def process_sheet(ws, dev, count_param, show_progress=True):
             continue
         # 创建新行
         name = rec['name']
-        group_data = {rec['group']: (rec['time'], rec['others'])}
+        group_data = {rec['group']: rec}
         used[i] = True
         # 向后查找可以合并的记录
         for j in range(i+1, len(records)):
-            if used[j]:
-                continue
             rj = records[j]
-            if rj['name'] == name and abs(rj['time'] - rec['time']) <= dev and rj['group'] != rec['group']:
-                # 检查该组是否已被占用（一个组只能有一个数据）
-                if rj['group'] in group_data:
-                    continue
-                group_data[rj['group']] = (rj['time'], rj['others'])
+            if rj['time'] - rec['time'] > dev:
+                break
+            if not used[j] and rj['name'] == name and rj['group'] not in group_data:
+                group_data[rj['group']] = rj
                 used[j] = True
         merged_rows.append({
             'name': name,
-            'group_data': group_data
+            'group_data': group_data,
+            'name_source': (rec['row'], groups[rec['group']]['name_col'] + 1),
         })
 
-    # 6. 构建新表头
-    # 第一列标题：取第一个名称列的原始标题，或 "Compound"
-    first_name_header = header_row_vals[groups[0]['name_col']] if groups else 'Compound'
-    name_header = str(first_name_header).strip() if first_name_header else 'Compound'
-    new_headers = [name_header]
-    # 对于每个组，按顺序取除名称列外的列标题
-    for g_idx, g in enumerate(groups):
-        # 本组的其他列（包括时间和其他）
-        other_cols = [g['time_col']] + g['other_cols']   # 时间列放在最前
-        for col_idx in other_cols:
-            title = header_row_vals[col_idx] if col_idx < len(header_row_vals) else ''
-            title = str(title).strip() if title else ''
-            if not title:
-                title = f'Col_{col_idx+1}'
-            # 加组序号避免重复
-            suffix = f'_{g_idx+1}'
-            new_title = title + suffix
-            new_headers.append(new_title)
+    name_col = groups[0]['name_col']
+    name_header = header_row_vals[name_col]
+    new_headers = [str(name_header).strip() if is_name_header(name_header) else "名称"]
+    header_columns = [name_col + 1]
+    for group_number, group in enumerate(groups, 1):
+        for col in (group['time_col'], *group['other_cols']):
+            title = header_row_vals[col]
+            if col == group['time_col'] and not is_time_header(title):
+                title = "保留时间"
+            title = str(title).strip() if title else f"Col_{col + 1}"
+            new_headers.append(f"{title}_{group_number}")
+            header_columns.append(col + 1)
 
-    # 7. 构建数据行（每行对应 merged_rows 中的一个）
     data_lines = []
-    for mr in merged_rows:
-        line = [mr['name']]
-        for g_idx, g in enumerate(groups):
-            if g_idx in mr['group_data']:
-                time_val, others = mr['group_data'][g_idx]
-                # 顺序：时间列 + other_cols
-                line.append(time_val)
-                line.extend(others)
-            else:
-                # 无数据，填空
-                line.append(None)
-                line.extend([None] * len(g['other_cols']))
+    for merged in merged_rows:
+        line = [(merged['name'], merged['name_source'])]
+        for group_index, group in enumerate(groups):
+            record = merged['group_data'].get(group_index)
+            if record is None:
+                line.extend([(None, None)] * (1 + len(group['other_cols'])))
+                continue
+            cols = (group['time_col'], *group['other_cols'])
+            for value, col in zip((record['time'], *record['others']), cols):
+                line.append((value, (record['row'], col + 1)))
         data_lines.append(line)
 
-    return above_rows, new_headers, data_lines
+    return header_row_idx + 1, header_columns, new_headers, data_lines
+
+
+def sort_sheet(ws, dev, count):
+    header_row = detect_header_row(ws) + 1
+    if (any(merge.max_row >= header_row for merge in ws.merged_cells.ranges)
+            or ws.tables or ws.auto_filter.ref
+            or ws._charts or ws._images or ws._pivots
+            or ws.data_validations.dataValidation or ws.conditional_formatting
+            or any(dimension.min != dimension.max for dimension in ws.column_dimensions.values())
+            or any(cell.row >= header_row and cell.data_type == "f"
+                   for cell in ws._cells.values())):
+        raise ValueError("排序区域含合并单元格、公式或其他依赖原位置的对象。")
+
+    header_row, header_columns, headers, data = process_sheet(ws, dev, count)
+    if header_row + len(data) > 1048576:
+        raise ValueError("对齐结果超出 Excel 的最大行数。")
+    columns = {key: copy(value) for key, value in ws.column_dimensions.items()}
+    source = {position: cell for position, cell in ws._cells.items() if position[0] >= header_row}
+    for position in source:
+        del ws._cells[position]
+    ws.column_dimensions.clear()
+
+    def write_cell(row, col, value, position):
+        original = source.get(position)
+        if value is None and original is None:
+            return
+        cell = ws.cell(row, col, value)
+        if cell.data_type == 'f':
+            cell.data_type = 's'
+        if original is not None:
+            cell._style = original._style
+            if original.comment:
+                cell.comment = copy(original.comment)
+            if original.hyperlink:
+                cell.hyperlink = copy(original.hyperlink)
+
+    for col, (title, original_col) in enumerate(zip(headers, header_columns), 1):
+        write_cell(header_row, col, title, (header_row, original_col))
+        dimension = columns.get(get_column_letter(original_col))
+        if dimension is not None:
+            dimension.index = get_column_letter(col)
+            dimension.min = dimension.max = col
+            ws.column_dimensions[dimension.index] = dimension
+    for row, line in enumerate(data, header_row + 1):
+        for col, (value, position) in enumerate(line, 1):
+            write_cell(row, col, value, position)
+
 
 def out():
     option = json.loads(sys.argv[1])
-    file = option["File"]
-    dev = float(option.get("Para1", 0.1))
-    count = option.get("Para2", 0)
-    count_param = None if count == "" else int(count)
+    dev = float(option.get("Para1", ""))
+    if not isfinite(dev) or dev < 0:
+        raise ValueError("保留时间偏差必须是非负数。")
+    count_value = option.get("Para2", "").strip()
+    count = int(count_value) if count_value else None
 
-    wb = openpyxl.load_workbook(file)
-    out_wb = openpyxl.Workbook()
-    # 删除默认的 Sheet
-    default_sheet = out_wb.active
-    out_wb.remove(default_sheet)
+    wb = openpyxl.load_workbook(option["File"])
+    try:
+        missing = prepare_sort_values(wb, option["File"])
 
-    sheet_names = wb.sheetnames
-    # 总进度：处理工作表
-    for sheet_name in tqdm(sheet_names, desc="处理工作表", unit="个"):
-        ws = wb[sheet_name]
-        above_rows, new_headers, data_lines = process_sheet(ws, dev, count_param, show_progress=True)
+        def process(ws):
+            require_saved_sort_values(ws, missing)
+            sort_sheet(ws, dev, count)
 
-        # 创建新 sheet
-        out_ws = out_wb.create_sheet(title=sheet_name)
+        process_workbook(wb, process)
+        out_path = save_workbook(wb)
+        print(f"处理完成，文件保存至：{out_path}")
+        report_output(out_path)
+    finally:
+        wb.close()
 
-        # 写入上方行
-        for r_idx, row_vals in enumerate(above_rows):
-            for c_idx, val in enumerate(row_vals):
-                if val is not None:
-                    out_ws.cell(row=r_idx+1, column=c_idx+1, value=val)
-
-        # 写入新表头（紧接着上方行之后）
-        header_row_num = len(above_rows) + 1
-        for c_idx, val in enumerate(new_headers):
-            out_ws.cell(row=header_row_num, column=c_idx+1, value=val)
-
-        # 写入数据行
-        for r_idx, row_vals in enumerate(data_lines):
-            row_num = header_row_num + 1 + r_idx
-            for c_idx, val in enumerate(row_vals):
-                if val is not None:
-                    out_ws.cell(row=row_num, column=c_idx+1, value=val)
-
-    # 保存
-    out_dir = "./output/"
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    filename = time.strftime('%Y%m%d%H%M%S', time.localtime())
-    out_path = os.path.join(out_dir, f"{filename}.xlsx")
-    out_wb.save(out_path)
-    print(f"处理完成，文件保存至：{out_path}")
 
 if __name__ == "__main__":
-    out()
+    sys.exit(run_script(out))

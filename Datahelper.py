@@ -3,6 +3,8 @@ import sys
 import os
 import json
 import base64
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 # ==================== 环境兼容 ====================
 # 自动检测是否为完整包环境（内嵌Python）
@@ -18,14 +20,15 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QFileDialog, QMessageBox
                               QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
                               QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox,
                               QWidget, QInputDialog)
-from PyQt5.QtCore import QProcess, QProcessEnvironment, QObject, pyqtSignal, Qt
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal, Qt
 
 # 版本信息
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __repo__ = "Funny1Potato/FP-DataHelper"
 
 # 导入更新模块
 from updater import Updater, CheckThread, DownloadThread
+from method_process import MethodProcess, PROGRAM_DIR
 
 
 # 图标 base64 数据 (64x64)
@@ -195,20 +198,37 @@ class main_Ui_Form(object):
 
 # ==================== 工具函数 ====================
 # 配置文件路径
-CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
-SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
-BUILTIN_WORKFLOWS_FILE = os.path.join(CONFIG_DIR, "builtin_workflows.json")
-USER_WORKFLOWS_FILE = os.path.join(CONFIG_DIR, "user_workflows.json")
+CONFIG_DIR = PROGRAM_DIR / "config"
+USER_DATA_DIR = PROGRAM_DIR / "user_data"
+SETTINGS_FILE = USER_DATA_DIR / "settings.json"
+BUILTIN_WORKFLOWS_FILE = PROGRAM_DIR / "builtin_workflows.json"
+USER_WORKFLOWS_FILE = USER_DATA_DIR / "user_workflows.json"
 
-# 确保配置目录存在
-os.makedirs(CONFIG_DIR, exist_ok=True)
+
+def user_config_path(path):
+    """旧安装的配置在首次写入新位置之前仍可读取。"""
+    return path if path.exists() else CONFIG_DIR / path.name
+
+
+def save_user_config(path, data):
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+    temporary = Path(stream.name)
+    try:
+        with stream:
+            json.dump(data, stream, indent=4, ensure_ascii=False)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
 
 def load_settings():
     """加载设置"""
     default = {"auto_check_update": True}
-    if os.path.exists(SETTINGS_FILE):
+    if user_config_path(SETTINGS_FILE).exists():
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            with user_config_path(SETTINGS_FILE).open(encoding="utf-8") as f:
                 return json.load(f)
         except:
             pass
@@ -216,23 +236,15 @@ def load_settings():
 
 def save_settings(settings):
     """保存设置"""
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=4, ensure_ascii=False)
+    save_user_config(SETTINGS_FILE, settings)
 
 def load_workflows():
     """加载预设工作流（合并内置和用户）"""
-    workflows = {}
-    # 加载内置预设
-    if os.path.exists(BUILTIN_WORKFLOWS_FILE):
-        try:
-            with open(BUILTIN_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
-                workflows.update(json.load(f))
-        except:
-            pass
+    workflows = load_builtin_workflows()
     # 加载用户预设
-    if os.path.exists(USER_WORKFLOWS_FILE):
+    if user_config_path(USER_WORKFLOWS_FILE).exists():
         try:
-            with open(USER_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+            with user_config_path(USER_WORKFLOWS_FILE).open(encoding="utf-8") as f:
                 workflows.update(json.load(f))
         except:
             pass
@@ -240,13 +252,15 @@ def load_workflows():
 
 def load_builtin_workflows():
     """加载内置预设"""
-    if os.path.exists(BUILTIN_WORKFLOWS_FILE):
-        try:
-            with open(BUILTIN_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
+    path = BUILTIN_WORKFLOWS_FILE
+    if not path.is_file():
+        path = CONFIG_DIR / path.name
+    try:
+        with path.open(encoding="utf-8") as stream:
+            workflows = json.load(stream)
+        return workflows if isinstance(workflows, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 def get_folders(path):
     folders = []
@@ -322,7 +336,7 @@ class AddTaskDialog(QDialog):
             return
         
         try:
-            with open(f"./Methods/{method_name}/Config.json", "r", encoding="utf-8") as f:
+            with (PROGRAM_DIR / "Methods" / method_name / "Config.json").open(encoding="utf-8") as f:
                 config = json.load(f)
             self.para1_input.setPlaceholderText(config.get("Para1", ""))
             self.para2_input.setPlaceholderText(config.get("Para2", ""))
@@ -435,7 +449,7 @@ class BatchDialog(QDialog):
         """选择输入文件"""
         file_name, _ = QFileDialog.getOpenFileName(
             self, "选择文件", "", 
-            "xlsx Files (*.xlsx);;xls Files (*.xls);;All Files (*)"
+            "Excel 工作簿 (*.xlsx)"
         )
         if file_name:
             self.file_input.setText(file_name)
@@ -458,7 +472,7 @@ class BatchDialog(QDialog):
     def move_down(self):
         """下移选中任务"""
         row = self.table.currentRow()
-        if row < len(self.task_queue) - 1:
+        if 0 <= row < len(self.task_queue) - 1:
             self.task_queue[row], self.task_queue[row+1] = self.task_queue[row+1], self.task_queue[row]
             self.update_table()
             self.table.selectRow(row+1)
@@ -496,9 +510,9 @@ class BatchDialog(QDialog):
         
         # 加载用户预设
         user_workflows = {}
-        if os.path.exists(USER_WORKFLOWS_FILE):
+        if user_config_path(USER_WORKFLOWS_FILE).exists():
             try:
-                with open(USER_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                with user_config_path(USER_WORKFLOWS_FILE).open(encoding="utf-8") as f:
                     user_workflows = json.load(f)
             except:
                 pass
@@ -527,8 +541,7 @@ class BatchDialog(QDialog):
         
         # 写入用户预设文件
         try:
-            with open(USER_WORKFLOWS_FILE, "w", encoding="utf-8") as f:
-                json.dump(user_workflows, f, indent=4, ensure_ascii=False)
+            save_user_config(USER_WORKFLOWS_FILE, user_workflows)
             
             # 更新下拉框
             all_workflows = load_workflows()
@@ -563,9 +576,9 @@ class BatchDialog(QDialog):
         
         # 加载并删除用户预设
         user_workflows = {}
-        if os.path.exists(USER_WORKFLOWS_FILE):
+        if user_config_path(USER_WORKFLOWS_FILE).exists():
             try:
-                with open(USER_WORKFLOWS_FILE, "r", encoding="utf-8") as f:
+                with user_config_path(USER_WORKFLOWS_FILE).open(encoding="utf-8") as f:
                     user_workflows = json.load(f)
             except:
                 pass
@@ -574,8 +587,7 @@ class BatchDialog(QDialog):
             del user_workflows[name]
             
             try:
-                with open(USER_WORKFLOWS_FILE, "w", encoding="utf-8") as f:
-                    json.dump(user_workflows, f, indent=4, ensure_ascii=False)
+                save_user_config(USER_WORKFLOWS_FILE, user_workflows)
                 
                 # 更新下拉框
                 all_workflows = load_workflows()
@@ -604,115 +616,90 @@ class BatchDialog(QDialog):
 
 
 class BatchExecutor(QObject):
-    """批量执行器"""
     task_started = pyqtSignal(int, str)
     task_finished = pyqtSignal(int, str)
-    all_finished = pyqtSignal()
     task_failed = pyqtSignal(int, str)
-    output_ready = pyqtSignal(str)  # 实时输出信号
-    
+    all_finished = pyqtSignal()
+    cancelled = pyqtSignal()
+    output_ready = pyqtSignal(str)
+
     def __init__(self, task_queue, parent=None):
         super().__init__(parent)
         self.task_queue = task_queue
         self.current_index = 0
-        self.last_output = None
-        self.process = None
-        self.output_buffer = ""
-    
+        self.input_file = task_queue[0].get("input_file", "") if task_queue else ""
+        self.job = None
+        self.active = False
+        self.awaiting_decision = False
+        self.skipped = 0
+
     def start(self):
-        """开始执行"""
-        if not self.task_queue:
-            self.all_finished.emit()
-            return
-        self.current_index = 0
-        self.last_output = None
+        self.active = True
         self.execute_next()
-    
+
     def execute_next(self):
-        """执行下一个任务"""
+        if not self.active:
+            return
         if self.current_index >= len(self.task_queue):
+            self.active = False
             self.all_finished.emit()
             return
-        
+
         task = self.task_queue[self.current_index]
         method = task["method"]
-        
-        # 第一个任务使用指定输入文件，后续任务使用上一步输出
-        if self.current_index == 0:
-            input_file = task.get("input_file", "")
-        else:
-            input_file = self.last_output or ""
-        
+        self.job = MethodProcess(self)
+        self.job.output_ready.connect(self.output_ready)
+        self.job.succeeded.connect(self.on_success)
+        self.job.failed.connect(self.on_failure)
+        self.job.cancelled.connect(self.on_cancelled)
         self.task_started.emit(self.current_index, method)
-        self.run_method(method, task.get("para1", ""), task.get("para2", ""), 
-                       task.get("para3", ""), input_file)
-    
-    def run_method(self, method, para1, para2, para3, input_file):
-        """运行单个方法"""
-        path = f"./Methods/{method}/__init__.py"
-        param = json.dumps({"Para1": para1, "Para2": para2, "Para3": para3, "File": input_file})
-        
-        self.output_buffer = ""
-        self.process = QProcess()
-        self.process.setProcessChannelMode(QProcess.MergedChannels)
-        self.process.readyReadStandardOutput.connect(self.on_ready_read)
-        self.process.finished.connect(self.on_finished)
-        
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUNBUFFERED", "1")
-        self.process.setProcessEnvironment(env)
-        
-        self.process.start(sys.executable, [path, param])
-    
-    def on_ready_read(self):
-        """读取输出"""
-        if self.process:
-            data = self.process.readAllStandardOutput().data()
-            try:
-                text = data.decode('gbk', errors='replace')
-            except:
-                text = data.decode('utf-8', errors='replace')
-            if text:
-                self.output_buffer += text
-                # 清理 tqdm 控制字符并发送
-                lines = text.split('\r')
-                for line in lines:
-                    clean = line.strip()
-                    if clean:
-                        self.output_ready.emit(clean)
-    
-    def on_finished(self, exit_code, exit_status):
-        """任务完成"""
-        if exit_code != 0:
-            self.task_failed.emit(self.current_index, self.output_buffer)
-            return
-        
-        # 解析输出文件路径
-        output_file = self.parse_output(self.output_buffer)
-        if output_file:
-            self.last_output = output_file
-        
-        self.task_finished.emit(self.current_index, output_file or "")
+        self.job.start(method, {
+            "Para1": task.get("para1", ""),
+            "Para2": task.get("para2", ""),
+            "Para3": task.get("para3", ""),
+            "File": self.input_file,
+        })
+
+    def release_job(self):
+        if self.job is not None:
+            self.job.deleteLater()
+            self.job = None
+
+    def on_success(self, path):
+        self.release_job()
+        self.input_file = path
+        self.task_finished.emit(self.current_index, path)
         self.current_index += 1
-        self.execute_next()
-    
-    def parse_output(self, text):
-        """解析输出，提取文件路径"""
-        import re
-        patterns = [
-            r"文件保存至[：:]\s*(.+)",
-            r"最终文件保存至[：:]\s*(.+)"
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1).strip()
-        return None
-    
+        QTimer.singleShot(0, self.execute_next)
+
+    def on_failure(self, error):
+        self.release_job()
+        self.awaiting_decision = True
+        self.task_failed.emit(self.current_index, error)
+
+    def resolve_failure(self, *, skip):
+        if not self.active or not self.awaiting_decision:
+            return
+        self.awaiting_decision = False
+        if skip:
+            self.skipped += 1
+            self.current_index += 1
+        QTimer.singleShot(0, self.execute_next)
+
+    def on_cancelled(self):
+        self.release_job()
+        self.active = False
+        self.cancelled.emit()
+
+    def send_input(self, text):
+        return self.job is not None and self.job.send_input(text)
+
     def stop(self):
-        """停止执行"""
-        if self.process and self.process.state() == QProcess.Running:
-            self.process.kill()
+        if self.active:
+            if self.job is not None:
+                self.job.stop()
+            else:
+                self.on_cancelled()
 
 
 # ==================== 主窗口 ====================
@@ -728,14 +715,16 @@ class MainForm(QMainWindow, main_Ui_Form):
         self.setCentralWidget(central_widget)
         self.setupUi(central_widget)
 
-        self.process = None
+        self.job = None
+        self.batch_executor = None
+        self.close_requested = False
 
         # 保存需要缩放的控件引用
         self._scalable_widgets = []
         self._init_scalable_widgets()
 
         # 方法列表
-        Methods = get_folders("./Methods")
+        Methods = get_folders(PROGRAM_DIR / "Methods")
         self.ChooseMethods.addItems(["请选择方法"])
         self.ChooseMethods.addItems(Methods)
         self.ChooseMethods.setCurrentIndex(0)
@@ -767,6 +756,8 @@ class MainForm(QMainWindow, main_Ui_Form):
         self.updater = Updater(__repo__, __version__)
         self.check_thread = None
         self.download_thread = None
+        self.download_cancelled = False
+        self.pending_update = None
         self._is_manual_check = False
         # 启动时检查更新（根据设置）
         settings = load_settings()
@@ -837,19 +828,19 @@ class MainForm(QMainWindow, main_Ui_Form):
         self.output_area.setFont(output_font)
 
     def openFile(self):
-        fileName, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "xlsx Files (*.xlsx);;xls Files (*.xls);;All Files (*)")
+        fileName, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "Excel 工作簿 (*.xlsx)")
         if fileName:
             self.file.setText(fileName)
 
     def openFileForPara1(self):
-        fileName, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "xlsx Files (*.xlsx);;xls Files (*.xls);;All Files (*)")
+        fileName, _ = QFileDialog.getOpenFileName(self, "选择文件", "", "Excel 工作簿 (*.xlsx)")
         if fileName:
             self.input1.setText(fileName)
 
     def Methods_changed(self, index):
         text = self.ChooseMethods.currentText()
         try:
-            with open(f"./Methods/{text}/Config.json", "r", encoding='utf-8') as file:
+            with (PROGRAM_DIR / "Methods" / text / "Config.json").open(encoding="utf-8") as file:
                 config_dict = json.loads(file.read())
             self.input1.setPlaceholderText(config_dict.get("Para1", ""))
             self.input2.setPlaceholderText(config_dict.get("Para2", ""))
@@ -861,7 +852,7 @@ class MainForm(QMainWindow, main_Ui_Form):
 
     def batch_clicked(self):
         """打开批量执行对话框"""
-        methods = get_folders("./Methods")
+        methods = get_folders(PROGRAM_DIR / "Methods")
         dialog = BatchDialog(methods, self)
         
         # 如果主窗口有文件选择，预填到对话框
@@ -878,7 +869,7 @@ class MainForm(QMainWindow, main_Ui_Form):
             if not input_file:
                 self.append_output("请先选择输入文件")
                 return
-            task_queue[0]["input_file"] = input_file
+            task_queue[0]["input_file"] = os.path.abspath(input_file)
             
             self.append_output("=" * 40)
             self.append_output("开始批量执行")
@@ -896,56 +887,59 @@ class MainForm(QMainWindow, main_Ui_Form):
             self.batch_executor.task_finished.connect(self.on_batch_task_finished)
             self.batch_executor.task_failed.connect(self.on_batch_task_failed)
             self.batch_executor.all_finished.connect(self.on_batch_all_finished)
+            self.batch_executor.cancelled.connect(self.on_batch_cancelled)
             self.batch_executor.output_ready.connect(self.append_output)
             self.batch_executor.start()
     
     def on_batch_task_started(self, index, method):
         """批量任务开始"""
+        self.set_input_enabled(True)
         self.append_output(f"\n>>> 执行任务 {index + 1}: {method}")
         self.append_output("-" * 30)
     
     def on_batch_task_finished(self, index, output_file):
         """批量任务完成"""
+        self.set_input_enabled(False)
         self.append_output(f"任务 {index + 1} 完成")
         if output_file:
             self.append_output(f"输出文件: {output_file}")
     
     def on_batch_task_failed(self, index, error):
-        """批量任务失败"""
-        self.append_output(f"任务 {index + 1} 失败")
-        self.append_output(f"错误: {error}")
-        
-        # 询问用户如何处理
-        reply = QMessageBox.question(
-            self, "任务失败",
-            f"任务 {index + 1} 执行失败，是否继续？",
-            QMessageBox.Yes | QMessageBox.No | QMessageBox.Retry
-        )
-        
-        if reply == QMessageBox.Retry:
-            # 重试当前任务
-            self.batch_executor.current_index = index
-            self.batch_executor.execute_next()
-        elif reply == QMessageBox.Yes:
-            # 跳过，继续下一个
-            self.batch_executor.current_index = index + 1
-            self.batch_executor.execute_next()
+        self.set_input_enabled(False)
+        self.append_output(f"任务 {index + 1} 失败：{error}")
+        dialog = QMessageBox(QMessageBox.Warning, "任务失败",
+                             f"任务 {index + 1} 失败。跳过后将继续使用该任务的输入文件。", parent=self)
+        retry = dialog.addButton("重试当前任务", QMessageBox.AcceptRole)
+        skip = dialog.addButton("跳过并继续", QMessageBox.ActionRole)
+        stop = dialog.addButton("终止批量", QMessageBox.RejectRole)
+        dialog.setEscapeButton(stop)
+        dialog.exec_()
+
+        clicked = dialog.clickedButton()
+        if clicked in (retry, skip):
+            if clicked == skip:
+                self.append_output(f"已跳过任务 {index + 1}")
+            self.batch_executor.resolve_failure(skip=clicked == skip)
         else:
-            # 终止
             self.batch_executor.stop()
-            self.on_batch_all_finished()
-    
+
     def on_batch_all_finished(self):
-        """批量任务全部完成"""
-        self.append_output("\n" + "=" * 40)
-        self.append_output("批量执行完成")
-        self.append_output("=" * 40)
-        
-        # 恢复按钮
+        skipped = self.batch_executor.skipped
+        summary = f"批量执行完成（跳过 {skipped} 个任务）" if skipped else "批量执行完成"
+        self.finish_batch(summary)
+
+    def on_batch_cancelled(self):
+        self.finish_batch("批量执行已终止")
+
+    def finish_batch(self, summary):
+        self.append_output(summary)
+        self.set_input_enabled(False)
         self.run.setText("运行")
         self.batch.setEnabled(True)
         self.option.setEnabled(True)
+        self.batch_executor.deleteLater()
         self.batch_executor = None
+        self.after_task()
 
     def option_clicked(self):
         """打开设置对话框"""
@@ -1038,103 +1032,73 @@ class MainForm(QMainWindow, main_Ui_Form):
         self.output_area.appendPlainText(text.rstrip('\n\r'))
 
     def send_input(self):
-        """发送输入到子进程"""
-        if self.process and self.process.state() == QProcess.Running:
-            text = self.cmd_input.text()
-            # 显示用户输入
-            if text:
-                self.append_output(f">>> {text}")
-            else:
-                self.append_output(">>> (回车)")
-            # 发送到子进程（即使为空也发送换行符）
-            self.process.write((text + '\n').encode('gbk'))
+        target = self.batch_executor or self.job
+        text = self.cmd_input.text()
+        if target is not None and target.send_input(text):
+            self.append_output(f">>> {text or '(回车)'}")
             self.cmd_input.clear()
 
     def set_input_enabled(self, enabled):
-        """启用/禁用输入区域"""
         self.cmd_input.setEnabled(enabled)
         self.send_btn.setEnabled(enabled)
         if enabled:
             self.cmd_input.setFocus()
+        else:
+            self.cmd_input.clear()
 
     def run_clicked(self):
-        # 如果正在运行批量任务，停止批量执行
-        if hasattr(self, 'batch_executor') and self.batch_executor:
-            self.batch_executor.stop()
-            self.append_output(">>> 用户终止了批量执行")
-            return
-        
-        # 如果正在运行单个任务，点击变为停止
-        if self.process and self.process.state() == QProcess.Running:
-            self.process.kill()
-            self.append_output(">>> 用户终止了程序")
+        target = self.batch_executor or self.job
+        if target is not None:
+            target.stop()
             return
 
-        text = self.ChooseMethods.currentText()
-        if text == "请选择方法":
+        method = self.ChooseMethods.currentText()
+        if method == "请选择方法":
             self.append_output("请先选择一个方法")
             return
 
-        path = f"./Methods/{text}/__init__.py"
-        if not os.path.exists(path):
-            self.append_output(f"错误：找不到方法文件 {path}")
-            return
-
-        para1 = self.input1.text() or ""
-        para2 = self.input2.text() or ""
-        para3 = self.input3.text() or ""
-        file = self.file.text() or ""
-
-        if not file and "RI" not in text:
+        filename = self.file.text()
+        if not filename:
             self.append_output("请先选择文件")
             return
 
-        param = json.dumps({"Para1": para1, "Para2": para2, "Para3": para3, "File": file})
-
-        # 启用停止功能
         self.run.setText("停止")
+        self.batch.setEnabled(False)
+        self.option.setEnabled(False)
         self.set_input_enabled(True)
-        self.append_output(f"开始执行: {text}")
+        self.append_output(f"开始执行: {method}")
         self.append_output("-" * 40)
 
-        # 使用 QProcess
-        self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.MergedChannels)
-        self.process.readyReadStandardOutput.connect(self.on_ready_read)
-        self.process.finished.connect(self.on_finished)
+        self.job = MethodProcess(self)
+        self.job.output_ready.connect(self.append_output)
+        self.job.succeeded.connect(self.on_single_success)
+        self.job.failed.connect(self.on_single_failure)
+        self.job.cancelled.connect(self.on_single_cancelled)
+        self.job.start(method, {
+            "Para1": self.input1.text(),
+            "Para2": self.input2.text(),
+            "Para3": self.input3.text(),
+            "File": os.path.abspath(filename),
+        })
 
-        # 禁用 Python 输出缓冲，确保实时显示
-        env = QtCore.QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUNBUFFERED", "1")
-        self.process.setProcessEnvironment(env)
+    def on_single_success(self, path):
+        self.finish_single(f"执行完成，输出文件：{path}")
 
-        self.process.start(sys.executable, [path, param])
+    def on_single_failure(self, error):
+        self.finish_single(f"执行失败：{error}")
 
-    def on_ready_read(self):
-        if self.process:
-            data = self.process.readAllStandardOutput().data()
-            try:
-                text = data.decode('gbk', errors='replace')
-            except:
-                text = data.decode('utf-8', errors='replace')
-            if text:
-                # 清理 tqdm 控制字符
-                lines = text.split('\r')
-                for line in lines:
-                    clean = line.strip()
-                    if clean:
-                        self.output_area.appendPlainText(clean)
-                # 滚动到底部
-                scrollbar = self.output_area.verticalScrollBar()
-                scrollbar.setValue(scrollbar.maximum())
+    def on_single_cancelled(self):
+        self.finish_single("执行已终止")
 
-    def on_finished(self, exit_code, exit_status):
-        self.run.setEnabled(True)
+    def finish_single(self, summary):
+        self.append_output(summary)
         self.run.setText("运行")
+        self.batch.setEnabled(True)
+        self.option.setEnabled(True)
         self.set_input_enabled(False)
-        self.append_output("-" * 40)
-        self.append_output(f"执行完成 (退出码: {exit_code})")
-        self.process = None
+        self.job.deleteLater()
+        self.job = None
+        self.after_task()
 
     # ==================== 更新相关方法 ====================
     def _check_update(self, force=False):
@@ -1146,26 +1110,61 @@ class MainForm(QMainWindow, main_Ui_Form):
             if not settings.get("auto_check_update", True):
                 return
         
+        if ((self.check_thread and self.check_thread.isRunning())
+                or (self.download_thread and self.download_thread.isRunning())):
+            return
+
         self._is_manual_check = force  # 记录是否手动检查
         
         self.check_thread = CheckThread(self.updater)
         self.check_thread.update_found.connect(self._on_update_found)
         self.check_thread.check_done.connect(self._on_check_done)
         self.check_thread.check_failed.connect(self._on_check_failed)
+        self.check_thread.finished.connect(self.resume_close)
         self.check_thread.start()
     
     def _on_check_done(self):
         """检查完成，无更新"""
-        if self._is_manual_check:
+        if self._is_manual_check and not self.close_requested:
             QMessageBox.information(self, "检查更新", "当前已是最新版本！")
     
     def _on_check_failed(self, error: str):
         """检查失败"""
-        if self._is_manual_check:
+        if self._is_manual_check and not self.close_requested:
             QMessageBox.warning(self, "检查更新", f"检查更新失败：\n{error}")
+
+    def after_task(self):
+        if self.close_requested:
+            self.resume_close()
+        elif self.pending_update:
+            info, self.pending_update = self.pending_update, None
+            QTimer.singleShot(0, lambda: self._on_update_found(info))
+
+    def resume_close(self):
+        if self.close_requested:
+            QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event):
+        target = self.batch_executor or self.job
+        checking = self.check_thread and self.check_thread.isRunning()
+        downloading = self.download_thread and self.download_thread.isRunning()
+        if not target and not checking and not downloading:
+            super().closeEvent(event)
+            return
+        self.close_requested = True
+        event.ignore()
+        if target:
+            target.stop()
+        if downloading:
+            self._cancel_download()
 
     def _on_update_found(self, info: dict):
         """发现新版本时弹窗提示"""
+        if self.close_requested:
+            return
+        if self.job or self.batch_executor:
+            self.pending_update = info
+            return
         version = info["version"]
         changelog = info["changelog"]
         
@@ -1190,7 +1189,9 @@ class MainForm(QMainWindow, main_Ui_Form):
 
     def _start_download(self, url: str):
         """开始下载更新"""
+        self.download_cancelled = False
         self.progress_dialog = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
+        self.progress_dialog.setAutoClose(False)
         self.progress_dialog.setWindowTitle("下载更新")
         self.progress_dialog.setWindowModality(QtCore.Qt.WindowModal)
         self.progress_dialog.setMinimumDuration(0)
@@ -1198,24 +1199,27 @@ class MainForm(QMainWindow, main_Ui_Form):
         
         self.download_thread = DownloadThread(self.updater, url)
         self.download_thread.progress.connect(self._on_download_progress)
-        self.download_thread.finished.connect(self._on_download_finished)
+        self.download_thread.downloaded.connect(self._on_download_finished)
         self.download_thread.error.connect(self._on_download_error)
+        self.download_thread.finished.connect(self.resume_close)
         
         self.progress_dialog.canceled.connect(self._cancel_download)
         self.download_thread.start()
 
     def _on_download_progress(self, downloaded: int, total: int):
         """更新下载进度"""
-        if total > 0:
-            percent = int(downloaded * 100 / total)
+        if total > 0 and not self.download_cancelled:
+            percent = min(100, int(downloaded * 100 / total))
             self.progress_dialog.setValue(percent)
             self.progress_dialog.setLabelText(f"正在下载更新... {percent}%\n已下载: {downloaded // 1024}KB / {total // 1024}KB")
 
     def _on_download_finished(self, zip_path: str):
         """下载完成，应用更新"""
-        self.progress_dialog.close()
-        
+        self.progress_dialog.hide()
+
         try:
+            if self.download_cancelled or self.close_requested:
+                return
             self.updater.apply_update(zip_path)
             
             msg = QMessageBox(self)
@@ -1233,17 +1237,22 @@ class MainForm(QMainWindow, main_Ui_Form):
                 self._restart_app()
         except Exception as e:
             QMessageBox.critical(self, "更新失败", f"应用更新时出错：\n{str(e)}")
+        finally:
+            try:
+                os.unlink(zip_path)
+            except OSError:
+                pass
 
     def _on_download_error(self, error: str):
         """下载失败"""
-        self.progress_dialog.close()
-        QMessageBox.warning(self, "下载失败", f"下载更新失败：\n{error}\n\n请稍后重试。")
+        self.progress_dialog.hide()
+        if not self.download_cancelled and not self.close_requested:
+            QMessageBox.warning(self, "下载失败", f"下载更新失败：\n{error}\n\n请稍后重试。")
 
     def _cancel_download(self):
-        """取消下载"""
-        if self.download_thread and self.download_thread.isRunning():
-            self.download_thread.terminate()
-            self.download_thread.wait()
+        self.download_cancelled = True
+        if self.download_thread:
+            self.download_thread.requestInterruption()
 
     def _restart_app(self):
         """重启应用程序"""

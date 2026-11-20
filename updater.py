@@ -3,14 +3,14 @@
 FP-DataHelper 自动更新模块
 """
 import os
-import sys
 import re
-import json
 import tempfile
 import shutil
 import zipfile
+from pathlib import Path, PurePosixPath
+from stat import S_ISLNK
 import requests
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QLockFile, QThread, pyqtSignal
 
 
 class Updater:
@@ -21,10 +21,17 @@ class Updater:
     # Release 下载链接模板
     DOWNLOAD_URL_TPL = "https://github.com/{repo}/releases/download/{tag}/FP-DataHelper.-.{tag}.zip"
     
+    PROGRAM_FILES = {
+        "Datahelper.py", "updater.py", "method_process.py", "method_support.py",
+        "Requirement.txt", "Version", "README.md", "LICENSE", "启动.bat",
+        "example.xlsx", "exampleRI.xlsx", "builtin_workflows.json", "config/builtin_workflows.json",
+    }
+    PROGRAM_DIRS = {"Methods", "Database", "images"}
+
     def __init__(self, repo: str, current_version: str):
         self.repo = repo
         self.current_version = current_version
-        self.program_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        self.program_dir = Path(__file__).resolve().parent
     
     def check_update(self) -> dict | None:
         """
@@ -69,84 +76,148 @@ class Updater:
             "changelog": "\n".join(changelog_lines) if changelog_lines else "无更新日志"
         }
     
-    def download(self, url: str, progress_callback=None) -> str:
-        """
-        下载更新包到临时目录
-        返回: 下载文件路径
-        """
-        temp_dir = tempfile.mkdtemp()
-        zip_path = os.path.join(temp_dir, "update.zip")
-        
-        resp = requests.get(url, stream=True, timeout=30)
-        resp.raise_for_status()
-        
-        total_size = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        
-        with open(zip_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback and total_size > 0:
-                    progress_callback(downloaded, total_size)
-        
-        return zip_path
-    
-    def apply_update(self, zip_path: str):
-        """
-        解压并替换当前程序文件
-        """
-        temp_dir = os.path.dirname(zip_path)
-        extract_dir = os.path.join(temp_dir, "extracted")
-        os.makedirs(extract_dir, exist_ok=True)
-        
-        # 使用 Python zipfile 解压，手动处理中文文件名编码
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for info in zf.infolist():
-                # 处理中文文件名：CP437 -> GBK
+    def download(self, url: str, progress_callback=None, cancelled=None) -> str:
+        """Stream a release into a temporary file."""
+        with tempfile.NamedTemporaryFile(prefix="fp-datahelper-", suffix=".zip", delete=False) as stream:
+            zip_path = Path(stream.name)
+        try:
+            with requests.get(url, stream=True, timeout=30) as response, zip_path.open("wb") as stream:
+                response.raise_for_status()
+                total = int(response.headers.get("content-length", 0))
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    if cancelled and cancelled():
+                        raise InterruptedError("更新下载已取消。")
+                    stream.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total > 0:
+                        progress_callback(downloaded, total)
+                if total and downloaded != total and not response.headers.get("content-encoding"):
+                    raise ValueError("更新包下载不完整。")
+        except BaseException:
+            zip_path.unlink(missing_ok=True)
+            raise
+        return str(zip_path)
+
+    def archive_files(self, archive):
+        """Find the application inside a flat or wrapped release archive."""
+        members = {}
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            filename = info.filename
+            if not info.flag_bits & 0x800:
                 try:
-                    # 尝试将文件名从 CP437 转换为 GBK
-                    raw_bytes = info.filename.encode('cp437')
-                    decoded_filename = raw_bytes.decode('gbk')
-                except:
-                    # 如果转换失败，使用原始文件名
-                    decoded_filename = info.filename
-                
-                # 构建目标路径
-                target_path = os.path.join(extract_dir, decoded_filename)
-                
-                # 创建目录
-                if info.is_dir():
-                    os.makedirs(target_path, exist_ok=True)
-                else:
-                    # 确保父目录存在
-                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                    # 解压文件
-                    with zf.open(info) as source, open(target_path, 'wb') as target:
-                        target.write(source.read())
-        
-        # 查找解压后的实际目录（可能有一层嵌套）
-        items = os.listdir(extract_dir)
-        if len(items) == 1 and os.path.isdir(os.path.join(extract_dir, items[0])):
-            source_dir = os.path.join(extract_dir, items[0])
-        else:
-            source_dir = extract_dir
-        
-        # 复制文件覆盖当前目录
-        for item in os.listdir(source_dir):
-            src = os.path.join(source_dir, item)
-            dst = os.path.join(self.program_dir, item)
-            
-            if os.path.isdir(src):
-                if os.path.exists(dst):
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
-            else:
-                shutil.copy2(src, dst)
-        
-        # 清理临时目录
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    
+                    filename = filename.encode("cp437").decode("gbk")
+                except UnicodeError:
+                    pass
+            path = PurePosixPath(filename.replace("\\", "/"))
+            if (path.is_absolute() or ":" in filename
+                    or any(part.endswith((".", " ")) for part in path.parts)
+                    or S_ISLNK(info.external_attr >> 16)):
+                raise ValueError("更新包包含无效路径。")
+            if path in members:
+                raise ValueError("更新包包含重复文件。")
+            members[path] = info
+
+        roots = [
+            path.parent for path in members
+            if path.name == "Datahelper.py" and path.with_name("updater.py") in members
+        ]
+        if len(roots) != 1:
+            raise ValueError("更新包缺少唯一的 FP-DataHelper 程序目录。")
+
+        files = {}
+        for path, info in members.items():
+            if not path.is_relative_to(roots[0]):
+                continue
+            relative = path.relative_to(roots[0])
+            if relative.as_posix() in self.PROGRAM_FILES or (
+                len(relative.parts) > 1 and relative.parts[0] in self.PROGRAM_DIRS
+            ):
+                files[relative] = info
+        if len({path.as_posix().casefold() for path in files}) != len(files):
+            raise ValueError("更新包包含名称冲突的程序文件。")
+        return files
+
+    def apply_update(self, zip_path: str):
+        """Stage and validate all files, then replace them with rollback on failure."""
+        program = Path(self.program_dir).resolve()
+        lock = QLockFile(str(program / ".fp-update.lock"))
+        lock.setStaleLockTime(0)
+        if not lock.tryLock(0):
+            raise OSError("无法锁定程序目录，可能已有另一个更新正在运行。")
+        try:
+            self.replace_program_files(program, zip_path)
+        finally:
+            lock.unlock()
+
+    def replace_program_files(self, program, zip_path):
+        work = Path(tempfile.mkdtemp(prefix=".fp-update-", dir=program))
+        staged = work / "staged"
+        backup = work / "backup"
+        replaced = []
+        created_dirs = []
+        keep_backup = False
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                files = self.archive_files(archive)
+                for relative, info in files.items():
+                    target = staged / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as source, target.open("wb") as destination:
+                        shutil.copyfileobj(source, destination)
+
+            targets = {}
+            for relative in files:
+                target = program / relative
+                if target.resolve() != target:
+                    raise ValueError(f"更新目标指向其他位置：{target}")
+                if target.exists() and not target.is_file():
+                    raise ValueError(f"更新目标不是文件：{target}")
+                saved = None
+                if target.is_file():
+                    saved = backup / relative
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(target, saved)
+                targets[relative] = (target, saved)
+
+            # Install the entry point after its supporting files.
+            for relative in sorted(files, key=lambda path: (path.name == "Datahelper.py", path.as_posix())):
+                target, saved = targets[relative]
+                missing_parents = []
+                parent = target.parent
+                while not parent.exists():
+                    missing_parents.append(parent)
+                    parent = parent.parent
+                for directory in reversed(missing_parents):
+                    directory.mkdir()
+                    created_dirs.append(directory)
+                os.replace(staged / relative, target)
+                replaced.append((target, saved))
+        except BaseException as error:
+            restore_errors = []
+            for target, saved in reversed(replaced):
+                try:
+                    if saved is None:
+                        target.unlink()
+                    else:
+                        os.replace(saved, target)
+                except OSError as restore_error:
+                    restore_errors.append(str(restore_error))
+            for directory in reversed(created_dirs):
+                try:
+                    directory.rmdir()
+                except OSError as restore_error:
+                    restore_errors.append(str(restore_error))
+            if restore_errors:
+                keep_backup = True
+                raise RuntimeError(f"更新失败且回滚不完整，备份位于 {backup}：{restore_errors[0]}") from error
+            raise
+        finally:
+            if not keep_backup:
+                shutil.rmtree(work, ignore_errors=True)
+
     @staticmethod
     def _is_newer(remote: str, local: str) -> bool:
         """比较版本号 v0.3.0 > v0.2.0"""
@@ -184,7 +255,7 @@ class DownloadThread(QThread):
     """后台下载线程"""
     
     progress = pyqtSignal(int, int)  # downloaded, total
-    finished = pyqtSignal(str)       # zip_path
+    downloaded = pyqtSignal(str)     # zip_path
     error = pyqtSignal(str)          # error message
     
     def __init__(self, updater: Updater, url: str):
@@ -196,8 +267,13 @@ class DownloadThread(QThread):
         try:
             zip_path = self.updater.download(
                 self.url,
-                progress_callback=lambda d, t: self.progress.emit(d, t)
+                progress_callback=self.progress.emit,
+                cancelled=self.isInterruptionRequested,
             )
-            self.finished.emit(zip_path)
+            if self.isInterruptionRequested():
+                Path(zip_path).unlink(missing_ok=True)
+            else:
+                self.downloaded.emit(zip_path)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.isInterruptionRequested():
+                self.error.emit(str(e))

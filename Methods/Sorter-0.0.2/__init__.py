@@ -1,8 +1,15 @@
-import os
 import openpyxl
-import time
 import sys
 import json
+from pathlib import Path
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from method_support import (
+    prepare_sort_values, process_workbook, report_output, require_saved_sort_values,
+    run_script, save_workbook,
+)
 
 head = ["A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
 "AA","AB","AC","AD","AE","AF","AG","AH","AI","AJ","AK","AL","AM","AN","AO","AP","AQ","AR","AS","AT","AU","AV","AW","AX","AY","AZ",
@@ -29,11 +36,12 @@ def process(workbook,sheetname,dev,count):
         del state[f"{i}"][0]
 
     #格式化数据
-    for k in range(0,156,count):
+    group_starts = range(0, len(head) - 1, count)
+    for k in group_starts:
         i = head[k]
         for j in range(len(state[f"{i}"])):
             order[f"{i}.{j}"] = state[f"{i}"][j]
-    for k in range(0,156,count):
+    for k in group_starts:
         i = head[k]
         for j in range(len(state[f"{i}"])):
             if order[f"{i}.{j}"] == None:
@@ -55,7 +63,7 @@ def process(workbook,sheetname,dev,count):
             continue
         sequence[f"{l}"] = [f"{h}.{n}"]
         marker.append(f"{h}.{n}")
-        lst = head[0::count]
+        lst = [head[index] for index in group_starts]
         for j in lst:
             if j == h:
                 continue
@@ -78,11 +86,20 @@ def process(workbook,sheetname,dev,count):
             column,line = j.split(".")
             line = int(line)
             st = head.index(column)
-            en = st + count
+            en = min(st + count, len(head))
             for k in range(st,en):
                 output[f"{i}"][k] = state[f"{head[k]}"][line]
     output["0"] = listhead
     return output
+
+def write_legacy_output(sheet, rows):
+    for row, values in enumerate(rows, 1):
+        for column, value in enumerate(values, 1):
+            if value is not None:
+                cell = sheet.cell(row, column, value)
+                if cell.data_type == "f":
+                    cell.data_type = "s"
+
 
 def out():
     option = json.loads(sys.argv[1])
@@ -90,29 +107,33 @@ def out():
     print(f"目标路径：{file}")
     dev = float(option["Para1"])
     count = int(option["Para2"])
-    workbook = openpyxl.load_workbook(f'{file}')
-    sheetlist = workbook.sheetnames
-    
-    #处理数据并保存至新文件
+    if not 2 <= count <= len(head):
+        raise ValueError("旧版排序要求每组至少两列，最多 156 列。")
+    workbook = openpyxl.load_workbook(file)
     try:
+        missing = prepare_sort_values(workbook, file)
         outbook = openpyxl.Workbook()
-        for sheetname in sheetlist:
-            outbook.create_sheet(f'{sheetname}')
-            outsheet = outbook[f'{sheetname}']
-            output = process(workbook,sheetname,dev,count)
-            for i in range(len(output)):
-                line = output[f"{i}"]
-                j = i + 1
-                for k in range(len(line)):
-                    outsheet[f"{head[k]}{j}"] = line[k]
-        path = "./output/"
-        if not os.path.exists(path):
-            os.mkdir(path)
-        filename = time.strftime('%Y%m%d%H%M%S', time.localtime())
-        outbook.save(f'{path}{filename}.xlsx')
-        print(f'已完成处理，文件名为{path}{filename}.xlsx')
-    except Exception as r:
-        print('错误:',f'{r}')
+        outbook.remove(outbook.active)
+
+        def sort_sheet(sheet):
+            result = outbook.create_sheet(sheet.title)
+            try:
+                require_saved_sort_values(sheet, missing)
+                output = process(workbook, sheet.title, dev, count)
+                if len(output) == 1:
+                    raise ValueError("未找到可排序的保留时间记录。")
+            except ValueError:
+                write_legacy_output(result, sheet.values)
+                raise
+            write_legacy_output(result, (output[str(row)] for row in range(len(output))))
+
+        process_workbook(workbook, sort_sheet)
+        out_path = save_workbook(outbook)
+        print(f"已完成处理，文件保存至：{out_path}")
+        report_output(out_path)
+    finally:
+        workbook.close()
+
 
 if __name__ == "__main__":
-    out()
+    sys.exit(run_script(out))

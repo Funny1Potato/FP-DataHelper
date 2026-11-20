@@ -1,10 +1,14 @@
-import os
 import openpyxl
-from openpyxl.styles import Font
-import time
+from copy import copy
+from pathlib import Path
 import sys
 import json
 from tqdm import tqdm
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from method_support import process_workbook, report_output, run_script, save_workbook
 
 # ================= 公共识别函数 =================
 def col_letters():
@@ -82,7 +86,6 @@ def process_sheet(ws, name_col_param):
         if name_col is None:
             raise ValueError(f"工作表 '{ws.title}' 中未找到名称列，请通过参数指定。")
 
-    red_font = Font(color="FF0000")
     si_count = 0
 
     for r_idx, row in enumerate(tqdm(data_rows, desc=f"扫描 {ws.title}", unit="行")):
@@ -94,7 +97,9 @@ def process_sheet(ws, name_col_param):
         if contains_si(name_val):
             # openpyxl 行号 = header下方第一行 + r_idx
             cell = ws.cell(row=header_idx + 2 + r_idx, column=name_col + 1)
-            cell.font = red_font
+            font = copy(cell.font)
+            font.color = "FF0000"
+            cell.font = font
             si_count += 1
 
     return si_count
@@ -108,26 +113,22 @@ def main():
         name_col_param = name_col_param.strip()
 
     wb = openpyxl.load_workbook(file)
-    total_si = 0
+    try:
+        total_si = 0
 
-    for sheet_name in tqdm(wb.sheetnames, desc="处理工作表", unit="个"):
-        ws = wb[sheet_name]
-        try:
+        def process(ws):
+            nonlocal total_si
             count = process_sheet(ws, name_col_param)
             total_si += count
-            print(f"  工作表 '{sheet_name}': 标记 {count} 个含硅物质")
-        except ValueError as e:
-            print(f"  工作表 '{sheet_name}' 处理失败: {e}")
-            continue
+            print(f"  工作表 '{ws.title}': 标记 {count} 个含硅物质")
 
-    # 保存
-    out_dir = "./output/"
-    if not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-    filename = time.strftime('%Y%m%d%H%M%S', time.localtime())
-    out_path = os.path.join(out_dir, f"{filename}_Si_marked.xlsx")
-    wb.save(out_path)
-    print(f"\n处理完成！共标记 {total_si} 个含硅物质，文件保存至：{out_path}")
+        process_workbook(wb, process)
+        out_path = save_workbook(wb, "_Si_marked")
+        print(f"处理完成！共标记 {total_si} 个含硅物质，文件保存至：{out_path}")
+        report_output(out_path)
+    finally:
+        wb.close()
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run_script(main))
