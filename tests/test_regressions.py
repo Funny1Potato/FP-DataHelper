@@ -164,6 +164,21 @@ print("文件保存至：" + params["File"])
         self.assertEqual(executor.current_index, 0)
         self.assertIn("missing.xlsx", failures[0][1])
 
+    def test_retired_sorter_stays_unavailable_with_leftover_installation_files(self):
+        retired = "Sorter-0.0.2"
+        self.method(retired, 'Path("legacy-ran").touch()\n')
+        self.method("Sorter-0.1.0", 'print("文件保存至：" + params["File"])\n')
+        self.assertEqual(Datahelper.get_folders(self.work / "Methods"), ["Sorter-0.1.0"])
+
+        executor = self.batch(retired, "Sorter-0.1.0")
+        failures = []
+        executor.task_failed.connect(lambda index, error: failures.append((index, error)))
+        executor.start()
+        self.wait(lambda: failures)
+        self.assertEqual(failures[0][0], 0)
+        self.assertIn("替换为 Sorter-0.1.0", failures[0][1])
+        self.assertFalse((self.work / "legacy-ran").exists())
+
     def test_stop_reports_cancel_and_does_not_start_next_task(self):
         self.method("waiting", 'print("ready", flush=True)\ninput()\n')
         executor = self.batch("waiting", "unused")
@@ -234,6 +249,72 @@ class WorkbookTests(unittest.TestCase):
         )
         path = json.loads(control.read_text(encoding="utf-8"))["output_file"] if control.exists() else None
         return run, path
+
+    def run_terminal(self, command, source, *options):
+        return subprocess.run(
+            [sys.executable, "-B", "-X", "utf8", str(ROOT / "fp_datahelper_cli.py"), command,
+             "--input", str(source), "--output-dir", str(self.work / "处理结果" / "Excel"), *options],
+            cwd=self.work, capture_output=True, encoding="utf-8", timeout=15,
+        )
+
+    def test_terminal_chains_sort_and_offline_ri_with_cas(self):
+        workbook = openpyxl.Workbook()
+        workbook.active.append(["Time", "Name", "CAS", "Time", "Name", "Area"])
+        workbook.active.append([2.9, "compound", "83-32-9", 3.1, "compound", 20])
+        workbook.create_sheet("Notes")["A1"] = "original"
+        source = self.work / "峰表.xlsx"
+        workbook.save(source)
+        original = source.read_bytes()
+
+        reference = self.work / "参考标准.xlsx"
+        standards = openpyxl.Workbook()
+        standards.active.append([6, 2])
+        standards.active.append([8, 4])
+        standards.save(reference)
+
+        sorted_run = self.run_terminal("sort", source, "--rt-tolerance", "0.5")
+        self.assertEqual(sorted_run.returncode, 0, sorted_run.stderr)
+        self.assertIn("Notes", sorted_run.stderr)
+        sorted_path = Path(json.loads(sorted_run.stdout)["output_file"])
+        ri_run = self.run_terminal("ri", sorted_path, "--alkanes", str(reference), "--cas-column", "C")
+        self.assertEqual(ri_run.returncode, 0, ri_run.stderr)
+        path = Path(json.loads(ri_run.stdout)["output_file"])
+        self.assertEqual(path.parent, self.work / "处理结果" / "Excel")
+        self.assertNotEqual(path, sorted_path)
+        self.assertEqual(source.read_bytes(), original)
+        result = openpyxl.load_workbook(path)
+        try:
+            headers, values = list(result.active.values)
+            self.assertEqual(values[headers.index("保留指数(线性)")], 700)
+            self.assertIn("83-32-9", values)
+            self.assertEqual(result["Notes"]["A1"].value, "original")
+        finally:
+            result.close()
+
+    def test_terminal_custom_threshold_filters_without_dialog(self):
+        workbook = openpyxl.Workbook()
+        workbook.active.append(["Name"])
+        workbook.active.append(["ACETIC ACID"])
+        source = self.work / "compounds.xlsx"
+        workbook.save(source)
+        run = self.run_terminal("threshold-full", source, "--match", "name",
+                                "--selection", "min", "--type-filter", "recognition")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = openpyxl.load_workbook(json.loads(run.stdout)["output_file"])
+        try:
+            self.assertEqual(result.active["B2"].value, "60.0")
+        finally:
+            result.close()
+
+    def test_terminal_fails_when_every_sheet_is_skipped(self):
+        workbook = openpyxl.Workbook()
+        workbook.active["A1"] = "No name column"
+        source = self.work / "invalid.xlsx"
+        workbook.save(source)
+        run = self.run_terminal("threshold-simple", source)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(run.stdout, "")
+        self.assertIn("没有成功处理任何工作表", run.stderr)
 
     def test_manual_group_width_overrides_recognized_headers(self):
         sorter = load_method("Sorter-0.1.0")
@@ -334,23 +415,18 @@ class WorkbookTests(unittest.TestCase):
         workbook.save(uncached)
         source = self.cache_formula_value(uncached, "sheet3", 20)
         original = source.read_bytes()
-        for method, options, name_cell in (
-            ("Sorter-0.1.0", {}, "A2"),
-            ("Sorter-0.0.2", {"Para2": "3"}, "B2"),
-        ):
-            with self.subTest(method=method):
-                result, output = self.run_method(method, source, Para1="0.5", **options)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("已保存的公式计算值", result.stdout)
-                with contextlib.closing(openpyxl.load_workbook(output)) as sorted_book:
-                    self.assertEqual(sorted_book.sheetnames, workbook.sheetnames)
-                    self.assertEqual(sorted_book[raw.title][name_cell].value, "A")
-                    self.assertEqual(sorted_book[raw.title]["C2"].value, 10)
-                    self.assertEqual(sorted_book["Summary"]["A1"].value, 20)
-                    self.assertEqual(sorted_book["Missing"]["A1"].value, "#N/A")
-                    self.assertEqual(sorted_book["Missing"]["A1"].data_type, "e")
-                    self.assertEqual(sort_source_sheets(sorted_book), set())
-                self.assertEqual(source.read_bytes(), original)
+        result, output = self.run_method("Sorter-0.1.0", source, Para1="0.5")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("已保存的公式计算值", result.stdout)
+        with contextlib.closing(openpyxl.load_workbook(output)) as sorted_book:
+            self.assertEqual(sorted_book.sheetnames, workbook.sheetnames)
+            self.assertEqual(sorted_book[raw.title]["A2"].value, "A")
+            self.assertEqual(sorted_book[raw.title]["C2"].value, 10)
+            self.assertEqual(sorted_book["Summary"]["A1"].value, 20)
+            self.assertEqual(sorted_book["Missing"]["A1"].value, "#N/A")
+            self.assertEqual(sorted_book["Missing"]["A1"].data_type, "e")
+            self.assertEqual(sort_source_sheets(sorted_book), set())
+        self.assertEqual(source.read_bytes(), original)
 
     def cache_formula_value(self, source, sheet_name, value):
         cached = self.work / f"{source.stem}-with-cache.xlsx"
@@ -548,6 +624,15 @@ class WorkbookTests(unittest.TestCase):
         driver.execute_script.return_value = 200
         method.check_page_status(driver)
 
+    def test_chemicalbook_explains_failure_without_interactive_input(self):
+        method = load_method("Cb_Spider--AromaNexus")
+        with (open(os.devnull, "w", encoding="utf-8") as log,
+              patch.object(method, "_get_data_logic", side_effect=RuntimeError("HTTP 503")),
+              patch("builtins.input", side_effect=EOFError),
+              contextlib.redirect_stdout(log)):
+            with self.assertRaisesRegex(OSError, "需人工处理：HTTP 503"):
+                method.get_chemicalbook_data_with_retry(None, "64-19-7")
+
     def test_example_sort_and_ri(self):
         result, sorted_file = self.run_method("Sorter-0.1.0", ROOT / "example.xlsx", Para1="0.5")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -697,6 +782,9 @@ class UpdaterTests(unittest.TestCase):
             path.write_text("keep", encoding="utf-8")
         archive = self.archive({
             "Datahelper.py": "new main", "updater.py": "new updater", "method_process.py": "new worker",
+            "fp_datahelper_cli.py": "new terminal", "skill_updates.py": "new checks",
+            "scripts/install_skill.py": "new installer", "scripts/install_skill.ps1": "new bootstrap",
+            "skills/fp-datahelper/SKILL.md": "new skill",
             "builtin_workflows.json": '{"packaged": []}',
             "config/builtin_workflows.json": '{"new": []}', "启动.bat": "new launcher",
             **{name: "packaged version" for name in preserved if not name.startswith("Methods/")},
@@ -708,6 +796,8 @@ class UpdaterTests(unittest.TestCase):
         self.assertTrue((self.program / "method_process.py").is_file())
         self.assertTrue((self.program / "builtin_workflows.json").is_file())
         self.assertTrue((self.program / "启动.bat").is_file())
+        self.assertEqual((self.program / "scripts" / "install_skill.ps1").read_text(encoding="utf-8"), "new bootstrap")
+        self.assertEqual((self.program / "skills" / "fp-datahelper" / "SKILL.md").read_text(encoding="utf-8"), "new skill")
 
     def test_failed_replace_restores_previous_program_files(self):
         archive = self.archive({

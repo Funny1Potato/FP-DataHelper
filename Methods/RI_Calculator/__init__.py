@@ -337,6 +337,9 @@ def add_nist_ri(workbook, sheet_positions, append):
 def main():
     option = json.loads(sys.argv[1])
     file = option["File"]
+    query_nist = option.get("Nist")
+    if query_nist is not None and not isinstance(query_nist, bool):
+        raise ValueError("Nist 须为 true 或 false。")
     para1 = option.get("Para1", "").strip()  # 参考文件路径
     para2 = option.get("Para2", "").strip()  # 公式,聚合
     para3 = option.get("Para3", "").strip()  # CAS列,名称列
@@ -388,13 +391,15 @@ def main():
         print(f"RI计算完成！文件保存至：{out_path}")
 
         if any(position[-1] is not None for position in positions.values()):
-            app = QApplication.instance() or QApplication(sys.argv)
-            reply = QMessageBox.question(
-                None, "NIST RI 查询",
-                "RI计算完成！是否查询NIST数据库进行RI对比？\n\n（查询过程较慢，每条约1秒）",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if reply == QMessageBox.Yes:
+            if query_nist is None:
+                app = QApplication.instance() or QApplication(sys.argv)
+                reply = QMessageBox.question(
+                    None, "NIST RI 查询",
+                    "RI计算完成！是否查询NIST数据库进行RI对比？\n\n（查询过程较慢，每条约1秒）",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+                )
+                query_nist = reply == QMessageBox.Yes
+            if query_nist:
                 print("开始NIST查询（每条约1秒，请耐心等待）...")
                 add_nist_ri(wb, positions, append)
                 out_path = save_workbook(wb, "_with_RI_NIST")

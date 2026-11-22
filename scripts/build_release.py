@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 EMBEDDED_PYTHON = "python-3.10.11-embed-amd64"
 ROOT_FILES = (
     "Datahelper.py", "updater.py", "method_process.py", "method_support.py",
+    "fp_datahelper_cli.py", "skill_updates.py", "scripts/install_skill.py", "scripts/install_skill.ps1",
+    "skills/fp-datahelper/SKILL.md", "INSTALL-SKILL.md",
     "builtin_workflows.json", "Version", "README.md", "LICENSE", "Requirement.txt",
     "启动.bat", "example.xlsx", "exampleRI.xlsx",
 )
@@ -41,7 +43,8 @@ def release_version():
 
 def application_files():
     tracked = subprocess.check_output(
-        ["git", "ls-files", "-z", "--", "Methods", "Database", "images"], cwd=ROOT
+        ["git", "ls-files", "-z", "--", "Methods", "Database", "images",
+         ":(exclude)Methods/Sorter-0.0.2/**"], cwd=ROOT
     ).decode("utf-8")
     resources = [
         path for path in tracked.split("\0")

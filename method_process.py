@@ -12,6 +12,7 @@ from method_support import CANCEL_PATH_ENV, METHOD_CANCELLED_EXIT_CODE, RESULT_P
 
 
 PROGRAM_DIR = Path(__file__).resolve().parent
+RETIRED_SORTER = "Sorter-0.0.2"
 LEGACY_OUTPUT = re.compile(r"(?:文件保存至[：:]|文件名为)[ \t]*(.+)")
 
 
@@ -40,6 +41,9 @@ class MethodProcess(QObject):
     def start(self, method, parameters):
         if self.stopping:
             self.cancelled.emit()
+            return
+        if method.casefold() == RETIRED_SORTER.casefold():
+            self.failed.emit(f"{RETIRED_SORTER} 已移除，请将此步骤替换为 Sorter-0.1.0。")
             return
         if not self.result_dir.isValid():
             self.failed.emit("无法创建任务结果的临时目录。")

@@ -23,6 +23,8 @@ class Updater:
     
     PROGRAM_FILES = {
         "Datahelper.py", "updater.py", "method_process.py", "method_support.py",
+        "fp_datahelper_cli.py", "skill_updates.py", "scripts/install_skill.py", "scripts/install_skill.ps1",
+        "skills/fp-datahelper/SKILL.md", "INSTALL-SKILL.md",
         "Requirement.txt", "Version", "README.md", "LICENSE", "启动.bat",
         "example.xlsx", "exampleRI.xlsx", "builtin_workflows.json", "config/builtin_workflows.json",
     }

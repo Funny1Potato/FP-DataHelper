@@ -12,6 +12,7 @@ from uuid import uuid4
 
 RESULT_PATH_ENV = "FP_DATAHELPER_RESULT_PATH"
 CANCEL_PATH_ENV = "FP_DATAHELPER_CANCEL_PATH"
+OUTPUT_DIR_ENV = "FP_DATAHELPER_OUTPUT_DIR"
 METHOD_CANCELLED_EXIT_CODE = 130
 SORT_SOURCE_NAME = "_FPDataHelper_SortSources"
 
@@ -68,8 +69,8 @@ def check_cancelled():
 
 
 def save_workbook(workbook, suffix=""):
-    directory = Path("output")
-    directory.mkdir(exist_ok=True)
+    directory = Path(os.environ.get(OUTPUT_DIR_ENV, "output"))
+    directory.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     path = directory / f"{timestamp}_{uuid4().hex[:12]}{suffix}.xlsx"
     with NamedTemporaryFile(dir=directory, suffix=".tmp", delete=False) as stream:

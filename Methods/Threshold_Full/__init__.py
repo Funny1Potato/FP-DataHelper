@@ -473,10 +473,18 @@ def main():
     option = json.loads(sys.argv[1])
     para1 = option.get("Para1", "").strip()
     para2 = option.get("Para2", "").strip().lower()
+    settings = option.get("ThresholdSettings")
     all_compounds, cas_index, name_index = load_full_thresholds()
     print(f"已加载阈值数据库: {len(all_compounds)} 个化合物")
 
-    if para2 in ("c", "custom"):
+    if settings is not None:
+        if (not isinstance(settings, dict)
+                or settings.get("match_mode") not in ("cas", "name")
+                or settings.get("value_mode") not in ("latest", "min", "max")
+                or settings.get("type_filter") not in ("全部", "detection", "recognition")):
+            raise ValueError("ThresholdSettings 含无效的匹配方式、取值方式或阈值类型。")
+        mode, dialog_type, calculate = "custom", None, process_custom_mode
+    elif para2 in ("c", "custom"):
         mode, dialog_type, calculate = "custom", CustomModeWindow, process_custom_mode
     elif para2 in ("m", "manual"):
         mode, dialog_type, calculate = "manual", ManualModeSettingsWindow, process_manual_mode
@@ -484,7 +492,7 @@ def main():
         mode, dialog_type, calculate = "default", None, process_default_mode
     print(f"运行模式: {mode}")
 
-    extra_args = ()
+    extra_args = (settings,) if settings is not None else ()
     if dialog_type is not None:
         app = QApplication.instance() or QApplication(sys.argv)
         dialog = dialog_type()

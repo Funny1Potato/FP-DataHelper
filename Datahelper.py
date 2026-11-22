@@ -23,12 +23,12 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QFileDialog, QMessageBox
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal, Qt
 
 # 版本信息
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __repo__ = "Funny1Potato/FP-DataHelper"
 
 # 导入更新模块
 from updater import Updater, CheckThread, DownloadThread
-from method_process import MethodProcess, PROGRAM_DIR
+from method_process import MethodProcess, PROGRAM_DIR, RETIRED_SORTER
 
 
 # 图标 base64 数据 (64x64)
@@ -266,7 +266,7 @@ def get_folders(path):
     folders = []
     files = os.listdir(path)
     for file in files:
-        if os.path.isdir(os.path.join(path, file)):
+        if file.casefold() != RETIRED_SORTER.casefold() and os.path.isdir(os.path.join(path, file)):
             folders.append(file)
     return folders
 

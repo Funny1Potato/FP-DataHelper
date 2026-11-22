@@ -58,7 +58,7 @@ def get_chemicalbook_data_with_retry(driver, cas):
                 user_input = input(">>> 请检查浏览器页面，恢复后按回车重试 (输入 n 跳过此条): ")
             except EOFError:
                 check_cancelled()
-                raise
+                raise OSError(f"ChemicalBook 查询 {cas} 失败，需人工处理：{e}") from e
             check_cancelled()
             
             if user_input.lower().strip() == 'n':
